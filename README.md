@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="Assets/background_fenyes.jpg" alt="InScop3 Recon" width="700">
+<img src="Assets/background_fenyes.jpg" alt="InScop3 Recon" width="900">
 <!-- <img src="assets/logo.png" alt="InScop3 Recon" width="220"> -->
 
 # InScop3 Recon
