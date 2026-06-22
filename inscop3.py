@@ -147,7 +147,7 @@ _TRANSLATIONS = {
     "col.dns_type":      {"hu": "DNS típus",            "en": "DNS type"},
     "col.dns_val":       {"hu": "DNS érték",            "en": "DNS value"},
     "col.takeover":      {"hu": "Takeover",             "en": "Takeover"},
-    "col.last_mod":      {"hu": "Utolsó módosítás",     "en": "Last modified"},
+    "col.last_mod":      {"hu": "Utolsó módosítás",     "en": "Last modification"},
     # ── Table tooltips ────────────────────────────────────────────────────────
     "tbl.dns_tip":       {"hu": "Kattints a DNS rekordok megtekintéséhez","en": "Click to show DNS records"},
     "tbl.sub_tip":       {"hu": "Bal klikk: vágólapra | Jobb klikk: eszközök | ▶: DNS rekordok","en": "Left click: copy | Right click: tools | ▶: DNS records"},
@@ -2226,7 +2226,7 @@ class ScopeConfirmDialog(QDialog):
     def __init__(self, scope, wildcard_count, url_count, preview,
                  default_rate=5, default_ua="", default_hdr="", parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Scope lista")
+        self.setWindowTitle("Scope lista" if _LANG.lang == "hu" else "Scope list")
         self.setMinimumWidth(540)
         self.setStyleSheet(SS)
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.Window)
