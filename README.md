@@ -72,8 +72,6 @@ It is designed for bug bounty hunters, penetration testers, and security researc
 
 ## Screenshots
 
-<img src="Assets/eng/1.jpg" alt="Main window" width="700">
-<img src="Assets/eng/2.jpg" alt="Main window" width="700">
 <img src="Assets/eng/3.jpg" alt="Main window" width="700">
 <img src="Assets/eng/4.jpg" alt="Main window" width="700">
 <img src="Assets/eng/5.jpg" alt="Main window" width="700">
@@ -401,7 +399,6 @@ inscop3/
 ├── README.md
 ├── LICENSE
 └── assets/               Put your logo and screenshots here
-    └── logo.png
 ```
 
 Installed locations:
