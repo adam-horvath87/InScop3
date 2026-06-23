@@ -147,7 +147,7 @@ _TRANSLATIONS = {
     "col.dns_type":      {"hu": "DNS típus",            "en": "DNS type"},
     "col.dns_val":       {"hu": "DNS érték",            "en": "DNS value"},
     "col.takeover":      {"hu": "Takeover",             "en": "Takeover"},
-    "col.last_mod":      {"hu": "Utolsó módosítás",     "en": "Last modification"},
+    "col.last_mod":      {"hu": "Utolsó módosítás",     "en": "Last modified"},
     # ── Table tooltips ────────────────────────────────────────────────────────
     "tbl.dns_tip":       {"hu": "Kattints a DNS rekordok megtekintéséhez","en": "Click to show DNS records"},
     "tbl.sub_tip":       {"hu": "Bal klikk: vágólapra | Jobb klikk: eszközök | ▶: DNS rekordok","en": "Left click: copy | Right click: tools | ▶: DNS records"},
@@ -2180,13 +2180,16 @@ class NucleiDialog(BaseToolDialog):
             for flag,h,hv,ph,defon in flags:
                 cb,le=self._add_flag(self._ol,flag,h,hv,ph,defon,"",flag in ["-o","-je","-me","-se"])
                 if flag=="-rl" and le:
-                    le.setText(str(self._r) if self._r>0 else "150"); cb.setChecked(True); le.setEnabled(True)
+                    if self._r > 0:
+                        le.setText(str(self._r)); cb.setChecked(True); le.setEnabled(True)
+                    else:
+                        cb.setChecked(False); le.setEnabled(False)  # Disable -rl if rate limit is 0
                 if flag=="-H" and (self._hdr or self._ua) and le:
                     parts=[]
                     if self._hdr: parts.append(f'"{self._hdr}"')
                     if self._ua:  parts.append(f'"User-Agent: {self._ua}"')
                     le.setText(" -H ".join(parts)); cb.setChecked(True); le.setEnabled(True)
-                if flag=="-sa": cb.setChecked(True)  # Enable -sa by default
+                if flag=="-sa": cb.setChecked(False)  # Keep -sa disabled by default
                 if flag=="-iv" and self._is_ip and le:
                     cb.setChecked(True); le.setEnabled(True)  # Enable -iv by default for IP
         self._ol.addStretch()
@@ -2226,7 +2229,7 @@ class ScopeConfirmDialog(QDialog):
     def __init__(self, scope, wildcard_count, url_count, preview,
                  default_rate=5, default_ua="", default_hdr="", parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Scope lista" if _LANG.lang == "hu" else "Scope list")
+        self.setWindowTitle("Scope lista")
         self.setMinimumWidth(540)
         self.setStyleSheet(SS)
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.Window)
@@ -2506,10 +2509,15 @@ class ScanWorker(QThread):
         if self._stop: return
         self._cmd(f"dnsx -l {shlex.quote(sf)} -resp -no-color -a -cname -o {shlex.quote(df)} -silent","dnsx",shell=True)
         self.progress.emit(75,"wget Last-Modified...")
-        # 4. wget last-modified
+        # 4. wget last-modified — csak httpx által talált URL-ekre
+        hdata=self._phttpx(hf)
+        httpx_subs=set(hdata.keys())
         last_mod={}
         for sub in subs:
             if self._stop: break
+            if sub not in httpx_subs:
+                last_mod[sub]="N/A"
+                continue
             val="N/A"
             for scheme in ["https","http"]:
                 try:
@@ -2521,7 +2529,7 @@ class ScanWorker(QThread):
             last_mod[sub]=val
         self.progress.emit(90,T("scan.db_building"))
         # 5. parse & merge
-        hdata=self._phttpx(hf); ddata=self._pdnsx(df)
+        ddata=self._pdnsx(df)
         db={}
         for sub in subs:
             h=hdata.get(sub,{}); dns=ddata.get(sub,[])
@@ -2822,10 +2830,17 @@ class _SyncScan:
         # 3. dnsx
         self._cmd(f"dnsx -l {shlex.quote(sf)} -resp -no-color -a -cname -o {shlex.quote(df)} -silent","dnsx",shell=True)
 
-        # 4. wget last-modified
+        # 4. wget last-modified — csak httpx által talált URL-ekre
+        w = ScanWorker.__new__(ScanWorker)  # reuse parsers without threading
+        w.log = type('L',(),{'emit':self._log})()
+        hdata = w._phttpx(hf) if hasattr(w,'_phttpx') else {}
+        httpx_subs=set(hdata.keys())
         last_mod={}
         for sub in subs:
             if self._stopped(): break
+            if sub not in httpx_subs:
+                last_mod[sub]="N/A"
+                continue
             val="N/A"
             for scheme in ["https","http"]:
                 try:
@@ -2839,9 +2854,6 @@ class _SyncScan:
             last_mod[sub]=val
 
         # 5. parse & merge
-        w = ScanWorker.__new__(ScanWorker)  # reuse parsers without threading
-        w.log = type('L',(),{'emit':self._log})()
-        hdata = w._phttpx(hf) if hasattr(w,'_phttpx') else {}
         ddata = w._pdnsx(df)  if hasattr(w,'_pdnsx') else {}
 
         db={}
