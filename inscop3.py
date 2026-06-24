@@ -872,30 +872,32 @@ class BaseToolDialog(QDialog):
         self._cedit.setToolTip(T("tool.cmd_tip"))
         pl.addWidget(self._cedit, 1); self._root.addWidget(pf)
 
-        # Output (SearchableOutput) + fullscreen gomb
+        # Output (SearchableOutput) + fullscreen gomb overlay a jobb alsó sarokba
         out_container = QWidget()
+        out_container.setMinimumHeight(130)
         out_lay = QVBoxLayout(out_container); out_lay.setContentsMargins(0,0,0,0); out_lay.setSpacing(0)
-        self._out = SearchableOutput()
+        self._out = SearchableOutput(out_container)
         self._out.setPlaceholderText(f"{self.TOOL_NAME} kimenet...")
-        self._out.setMinimumHeight(130)
         out_lay.addWidget(self._out)
 
-        # Fullscreen gomb sor
-        fs_bar = QWidget(); fs_bar.setStyleSheet(f"background:{D['surf2']};")
-        fs_bar_lay = QHBoxLayout(fs_bar); fs_bar_lay.setContentsMargins(4,2,4,2)
-        fs_bar_lay.addStretch()
-        self._fs_btn = QPushButton("⛶")
+        # Fullscreen gomb — float overlay a jobb alsó sarokba
+        self._fs_btn = QPushButton("⛶", out_container)
         self._fs_btn.setFixedSize(22, 22)
         self._fs_btn.setToolTip("Kimenet teljes képernyő / visszaállítás")
         self._fs_btn.setStyleSheet(
-            f"QPushButton{{background:{D['surf']};color:{D['muted']};border:1px solid {D['border']};"
+            f"QPushButton{{background:rgba(30,30,40,200);color:{D['muted']};border:1px solid {D['border']};"
             f"border-radius:4px;font-size:12px;padding:0;}}"
             f"QPushButton:hover{{background:{D['acc']};color:#fff;border-color:{D['acc']};}}"
         )
         self._fs_btn.clicked.connect(self._toggle_fullscreen_out)
         self._fs_mode = False
-        fs_bar_lay.addWidget(self._fs_btn)
-        out_lay.addWidget(fs_bar)
+
+        # Pozicionálás: QTimer poll — elkerüli a resizeEvent override crash-t
+        self._fs_pos_timer = QTimer(self)
+        self._fs_pos_timer.setInterval(200)
+        self._fs_pos_timer.timeout.connect(self._reposition_fs_btn)
+        self._fs_pos_timer.start()
+
         self._root.addWidget(out_container)
         self._out_container = out_container
 
@@ -1118,6 +1120,18 @@ class BaseToolDialog(QDialog):
                 self._out.insertHtml(f"<br><span style='color:{D['green']}'>✓ {msg}</span>")
             else:
                 self._out.insertHtml(f"<br><span style='color:{D['red']}'>✗ {msg}</span>")
+
+    def _reposition_fs_btn(self):
+        """Fullscreen gomb pozicionálása a szövegterület (edit) jobb alsó sarkába."""
+        if not hasattr(self, '_fs_btn') or not hasattr(self, '_out'): return
+        edit = getattr(self._out, 'edit', None)
+        if not edit: return
+        # edit jobb alsó sarka, out_container koordináta-rendszerében
+        bottom_right = self._out.mapTo(self._out_container, edit.rect().bottomRight())
+        bw = self._fs_btn.width()
+        bh = self._fs_btn.height()
+        self._fs_btn.move(bottom_right.x() - bw - 6, bottom_right.y() - bh - 6)
+        self._fs_btn.raise_()
 
     def _toggle_fullscreen_out(self):
         """Kimenet-panel teljes ablakra nagyítása / visszaállítása."""
