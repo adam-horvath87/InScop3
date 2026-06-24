@@ -3,11 +3,24 @@
 Arch Linux | PyQt6 | subfinder + httpx + dnsx + dig + nmap + nuclei + naabu + curl + wget
 """
 
-import sys, subprocess, re, os, tempfile, json, shlex, threading
+import sys, subprocess, re, os, tempfile, json, shlex, threading, ipaddress
 import html as _html
 from datetime import datetime
 from collections import defaultdict
 from threading import Lock
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Globális lista: minden megnyitott tool ablak referenciáját itt tároljuk.
+# Ez megakadályozza, hogy a Python GC megsemmisítse az objektumot futó QThread
+# mellett (ami SIGABRT-ot okozna: "QThread destroyed while still running").
+_OPEN_DIALOGS = []
+
+class _AppSettings:
+    """Globális beállítások singleton — elérhetők parent nélkül is (parent=None ablakok)."""
+    _rate = None        # QSpinBox referencia
+    _user_agent = None  # QLineEdit referencia
+    _req_header = None  # QLineEdit referencia
+    _sudo_pw = None     # str
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -170,10 +183,12 @@ _TRANSLATIONS = {
     "dep.missing":       {"hu": "Hiányzó eszközök:\n{cmds}","en": "Missing tools:\n{cmds}"},
     "dep.system":        {"hu": "Rendszerrel jár",      "en": "Comes with system"},
     # ── File dialogs ──────────────────────────────────────────────────────────
-    "file.pipe_save":    {"hu": "Mentés pipe-formátumba","en": "Save as pipe format"},
-    "file.pipe_filter":  {"hu": "Pipe-separated TXT (*.txt);;Minden fájl (*)","en": "Pipe-separated TXT (*.txt);;All files (*)"},
-    "file.pipe_open":    {"hu": "Pipe-formátumú fájl megnyitása","en": "Open pipe-format file"},
-    "file.import_ok":    {"hu": "✓ Importálva: {msg}",  "en": "✓ Imported: {msg}"},
+    "file.pipe_save":    {"hu": "Munkamenet mentése","en": "Save session"},
+    "file.pipe_filter":  {"hu": "InScop3 munkamenet (*.inscop3);;Minden fájl (*)","en": "InScop3 session (*.inscop3);;All files (*)"},
+    "file.pipe_open":    {"hu": "Munkamenet megnyitása","en": "Open session"},
+    "file.import_ok":    {"hu": "✓ Betöltve: {msg}",  "en": "✓ Loaded: {msg}"},
+    "file.import_err":   {"hu": "✗ Betöltési hiba: {msg}", "en": "✗ Load error: {msg}"},
+    "file.save_ok":      {"hu": "✓ Mentve: {path}",   "en": "✓ Saved: {path}"},
     # ── Missing domain warning ────────────────────────────────────────────────
     "warn.no_domain_title":{"hu": "Hiányzó adat",      "en": "Missing data"},
     "warn.no_domain_msg":  {"hu": "Add meg a domain nevet!","en": "Please enter a domain name!"},
@@ -544,13 +559,13 @@ class NotesEditor(QWidget):
 
 # ─── NotesDialog — standalone ablak ──────────────────────────────────────────
 class NotesDialog(QMainWindow):
-    """Önálló főablak a jegyzetszerkesztőhöz."""
+    """Önálló főablak a jegyzetszerkesztőhöz — saját tálcaikon."""
     def __init__(self, parent=None):
-        super().__init__(parent)
+        super().__init__(None)   # parent=None → önálló ablak a tálcán
         self.setWindowTitle(T("notes.title"))
         self.setMinimumSize(680, 520)
         self.setStyleSheet(SS)
-        self.setWindowFlags(self.windowFlags() | Qt.WindowType.Window)
+        self.setWindowFlags(Qt.WindowType.Window)
 
         cw = QWidget(); self.setCentralWidget(cw)
         lay = QVBoxLayout(cw); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(0)
@@ -603,6 +618,55 @@ class CmdWorker(QThread):
             self.finished.emit(not self._stop and self._proc.returncode==0)
         except Exception as e:
             self.output.emit(f"Hiba: {e}"); self.finished.emit(False)
+
+
+class FfufCmdWorker(QThread):
+    """Ffuf-specifikus worker: soronként bufferel, max 50ms-onként küld UI-ra.
+    Megakadályozza a UI befagyását nagy sebességű ffuf kimenetnél."""
+    batch_output = pyqtSignal(list)   # list of str sorok
+    finished     = pyqtSignal(bool)
+
+    FLUSH_INTERVAL_MS = 80   # ennyi ms-onként flush a UI-ra
+    MAX_BATCH         = 200  # max ennyi sor egy batch-ben (maradék eldobva ha több)
+    MAX_BUFFER        = 2000 # ha a buffer ennyi sor fölé nő, eldobjuk a legrégebbieket
+
+    def __init__(self, cmd):
+        super().__init__()
+        self._cmd = cmd; self._proc = None; self._stop = False
+
+    def stop(self):
+        self._stop = True
+        if self._proc:
+            try: self._proc.terminate()
+            except: pass
+
+    def run(self):
+        import time
+        try:
+            self._proc = subprocess.Popen(
+                self._cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1)
+            buf = []
+            last_flush = time.monotonic()
+            for line in self._proc.stdout:
+                if self._stop: break
+                buf.append(line.rstrip())
+                # Ha a buffer túl nagy, eldobjuk a legrégebbieket
+                if len(buf) > self.MAX_BUFFER:
+                    buf = buf[-self.MAX_BUFFER:]
+                now = time.monotonic()
+                if (now - last_flush) * 1000 >= self.FLUSH_INTERVAL_MS:
+                    if buf:
+                        self.batch_output.emit(buf[:self.MAX_BATCH])
+                        buf = buf[self.MAX_BATCH:]
+                    last_flush = now
+            # Utolsó maradék flush
+            if buf:
+                self.batch_output.emit(buf[:self.MAX_BATCH])
+            self._proc.wait()
+            self.finished.emit(not self._stop and self._proc.returncode == 0)
+        except Exception as e:
+            self.batch_output.emit([f"Hiba: {e}"]); self.finished.emit(False)
 
 # ─── ANSI color → HTML converter ─────────────────────────────────────────────
 import re as _re_ansi
@@ -739,21 +803,20 @@ class SearchableOutput(QWidget):
     def get_text(self):
         """Get console output as plain text"""
         return self.edit.toPlainText()
-        doc=self.edit.document(); cur=QTextCursor(doc)
-        cur.select(QTextCursor.SelectionType.Document); cur.setCharFormat(QTextCharFormat())
 
 # ─── BaseToolDialog ───────────────────────────────────────────────────────────
 class BaseToolDialog(QDialog):
     TOOL_NAME="tool"; ICON="🔧"; SUBTITLE=""
 
     def __init__(self,host,dns_values,parent=None):
-        super().__init__(parent)
+        # Nincs parent → teljesen önálló ablak, saját tálcaikon
+        super().__init__(None)
         self.host=host; self.dns_values=dns_values
         self._flag_widgets=[]; self._tgts=[]; self._tgt_group=None
-        self.setWindowTitle(f"{self.TOOL_NAME} — {host}")
+        self.setWindowTitle(f"{self.ICON}  {self.TOOL_NAME} — {host}")
         self.setMinimumSize(900,760); self.setStyleSheet(SS)
-        # Make tool dialogs independent windows on taskbar
-        self.setWindowFlags(self.windowFlags() | Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
+        # Önálló ablak: saját tálcaikon, nincs always-on-top
+        self.setWindowFlags(Qt.WindowType.Window)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose,False)
         self._scaffold(); self._build_flags(); self._update_cmd()
 
@@ -809,11 +872,32 @@ class BaseToolDialog(QDialog):
         self._cedit.setToolTip(T("tool.cmd_tip"))
         pl.addWidget(self._cedit, 1); self._root.addWidget(pf)
 
-        # Output (SearchableOutput)
+        # Output (SearchableOutput) + fullscreen gomb
+        out_container = QWidget()
+        out_lay = QVBoxLayout(out_container); out_lay.setContentsMargins(0,0,0,0); out_lay.setSpacing(0)
         self._out = SearchableOutput()
         self._out.setPlaceholderText(f"{self.TOOL_NAME} kimenet...")
         self._out.setMinimumHeight(130)
-        self._root.addWidget(self._out)
+        out_lay.addWidget(self._out)
+
+        # Fullscreen gomb sor
+        fs_bar = QWidget(); fs_bar.setStyleSheet(f"background:{D['surf2']};")
+        fs_bar_lay = QHBoxLayout(fs_bar); fs_bar_lay.setContentsMargins(4,2,4,2)
+        fs_bar_lay.addStretch()
+        self._fs_btn = QPushButton("⛶")
+        self._fs_btn.setFixedSize(22, 22)
+        self._fs_btn.setToolTip("Kimenet teljes képernyő / visszaállítás")
+        self._fs_btn.setStyleSheet(
+            f"QPushButton{{background:{D['surf']};color:{D['muted']};border:1px solid {D['border']};"
+            f"border-radius:4px;font-size:12px;padding:0;}}"
+            f"QPushButton:hover{{background:{D['acc']};color:#fff;border-color:{D['acc']};}}"
+        )
+        self._fs_btn.clicked.connect(self._toggle_fullscreen_out)
+        self._fs_mode = False
+        fs_bar_lay.addWidget(self._fs_btn)
+        out_lay.addWidget(fs_bar)
+        self._root.addWidget(out_container)
+        self._out_container = out_container
 
         # Buttons
         bl = QHBoxLayout()
@@ -868,9 +952,8 @@ class BaseToolDialog(QDialog):
         b.setToolTip(tip); b.clicked.connect(lambda _=False,t=tip: QToolTip.showText(QCursor.pos(),t)); return b
 
     def _brbtn(self,le):
-        from PyQt6.QtGui import QIcon, QPixmap
+        from PyQt6.QtGui import QIcon
         from PyQt6.QtCore import QSize
-        import os
         b=QPushButton()
         b.setFixedSize(34,34)
         b.setToolTip(T("tool.file_browse"))
@@ -1035,6 +1118,29 @@ class BaseToolDialog(QDialog):
                 self._out.insertHtml(f"<br><span style='color:{D['green']}'>✓ {msg}</span>")
             else:
                 self._out.insertHtml(f"<br><span style='color:{D['red']}'>✗ {msg}</span>")
+
+    def _toggle_fullscreen_out(self):
+        """Kimenet-panel teljes ablakra nagyítása / visszaállítása."""
+        self._fs_mode = not self._fs_mode
+        # Megkeressük az összes widgetet a tool panelen és elrejtjük/megjelenítjük
+        for i in range(self._root.count()):
+            item = self._root.itemAt(i)
+            if item and item.widget():
+                w = item.widget()
+                if w is self._out_container:
+                    continue  # az output mindig látható
+                w.setVisible(not self._fs_mode)
+            elif item and item.layout():
+                # header layout: elrejtjük az egész sort
+                for j in range(item.layout().count()):
+                    sub = item.layout().itemAt(j)
+                    if sub and sub.widget():
+                        sub.widget().setVisible(not self._fs_mode)
+        self._fs_btn.setText("✕" if self._fs_mode else "⛶")
+        self._fs_btn.setToolTip("Visszaállítás" if self._fs_mode else "Kimenet teljes képernyő / visszaállítás")
+        # Scroll area max magasság eltávolítása/visszaállítása
+        if hasattr(self, '_osc'):
+            self._osc.setMaximumHeight(16777215 if self._fs_mode else 310)
 
     def _toggle_notes_panel(self):
         """Jobb oldali notes panel — az EGÉSZ ablak felét nyitja/zárja."""
@@ -2145,7 +2251,6 @@ class NucleiDialog(BaseToolDialog):
     @staticmethod
     def _check_if_ip(target):
         """Ellenőriz, hogy a target IP cím-e"""
-        import ipaddress
         try:
             ipaddress.ip_address(target.split(':')[0].strip('[]'))
             return True
@@ -2413,8 +2518,7 @@ def parse_scope_file(path):
             is_wildcard = True
         
         # Strip protocol if present
-        import re as _re
-        target = _re.sub(r"^https?://", "", target).rstrip("/")
+        target = re.sub(r"^https?://", "", target).rstrip("/")
 
         # Skip if clearly not a domain (IP ranges, empty, too short)
         if not target or " " in target or "," in target:
@@ -2438,12 +2542,9 @@ def parse_scope_file(path):
 
 def _looks_like_target(s):
     """Heuristic: does this line look like a new domain/URL target?"""
-    import re as _re
     s = s.strip()
     if not s: return False
-    # Has a dot and no spaces → likely a domain
     if "." in s and " " not in s: return True
-    # Starts with http
     if s.startswith("http"): return True
     return False
 
@@ -2509,24 +2610,32 @@ class ScanWorker(QThread):
         if self._stop: return
         self._cmd(f"dnsx -l {shlex.quote(sf)} -resp -no-color -a -cname -o {shlex.quote(df)} -silent","dnsx",shell=True)
         self.progress.emit(75,"wget Last-Modified...")
-        # 4. wget last-modified — csak httpx által talált URL-ekre
+        # 4. wget last-modified — csak httpx által talált URL-ekre, párhuzamosan
         hdata=self._phttpx(hf)
         httpx_subs=set(hdata.keys())
-        last_mod={}
-        for sub in subs:
-            if self._stop: break
-            if sub not in httpx_subs:
-                last_mod[sub]="N/A"
-                continue
-            val="N/A"
-            for scheme in ["https","http"]:
+        last_mod={sub:"N/A" for sub in subs}
+
+        def _wget_one(sub):
+            if self._stop: return sub,"N/A"
+            for scheme in ("https","http"):
                 try:
-                    r=subprocess.run(f'wget --server-response --spider --timeout=3 --tries=1 -q -O /dev/null "{scheme}://{sub}" 2>&1 | grep -i "Last-Modified:" | sed \'s/^[[:space:]]*//' + "' | cut -d' ' -f2-",
+                    r=subprocess.run(
+                        f'wget --server-response --spider --timeout=3 --tries=1 -q -O /dev/null'
+                        f' "{scheme}://{sub}" 2>&1 | grep -i "Last-Modified:" | sed \'s/^[[:space:]]*//' + "' | cut -d' ' -f2-",
                         shell=True,capture_output=True,text=True,timeout=8)
                     v=(r.stdout or r.stderr).strip()
-                    if v: val=v; break
+                    if v: return sub,v
                 except: pass
-            last_mod[sub]=val
+            return sub,"N/A"
+
+        httpx_subs_list=[s for s in subs if s in httpx_subs]
+        max_workers=min(20,len(httpx_subs_list)) if httpx_subs_list else 1
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs={ex.submit(_wget_one,s):s for s in httpx_subs_list}
+            for fut in as_completed(futs):
+                if self._stop: break
+                sub,val=fut.result(); last_mod[sub]=val
+
         self.progress.emit(90,T("scan.db_building"))
         # 5. parse & merge
         ddata=self._pdnsx(df)
@@ -2543,10 +2652,13 @@ class ScanWorker(QThread):
         data={}
         if not os.path.exists(fp2): return data
         try:
-            with open(fp2,encoding="utf-8",errors="ignore") as f: content=f.read().strip()
-            if not content: return data
-            if content.splitlines()[0].strip().startswith("{"):
-                for line in content.splitlines():
+            with open(fp2,encoding="utf-8",errors="ignore") as f:
+                first=f.readline().strip()
+                if not first: return data
+                is_json=first.startswith("{")
+                lines=[first]+f.readlines()
+            if is_json:
+                for line in lines:
                     line=line.strip()
                     if not line: continue
                     try:
@@ -2555,28 +2667,19 @@ class ScanWorker(QThread):
                         host=re.sub(r'^https?://','',url).rstrip('/')
                         if not host: continue
                         tr=j.get("technologies",j.get("tech",[]))
-                        final_code = str(j.get("status_code",""))
-                        # Build status display from chain
-                        # httpx JSON: chain_status_codes:[301,406] contains the FULL chain
-                        # including the final code as the last element.
-                        # If no chain, just show status_code.
-                        chain_codes_raw = j.get("chain_status_codes", [])
+                        final_code=str(j.get("status_code",""))
+                        chain_codes_raw=j.get("chain_status_codes",[])
                         if not chain_codes_raw:
-                            # fallback: try "chain" array of objects
-                            chain = j.get("chain", [])
-                            chain_codes_raw = [c.get("status_code","") for c in chain if c.get("status_code")]
-                        chain_codes = [str(c) for c in chain_codes_raw if str(c)]
-                        if chain_codes:
-                            # chain_status_codes already contains the complete redirect chain
-                            # e.g. [301, 406] or [302, 302, 200] — show all as-is
-                            status_display = ", ".join(chain_codes)
-                        else:
-                            # No chain — just the single status_code
-                            status_display = final_code
-                        data[host]={"status_code":status_display,"title":j.get("title",""),"webserver":j.get("webserver",""),"tech":", ".join(tr) if isinstance(tr,list) else str(tr)}
+                            chain=j.get("chain",[])
+                            chain_codes_raw=[c.get("status_code","") for c in chain if c.get("status_code")]
+                        chain_codes=[str(c) for c in chain_codes_raw if str(c)]
+                        status_display=", ".join(chain_codes) if chain_codes else final_code
+                        data[host]={"status_code":status_display,"title":j.get("title",""),
+                                    "webserver":j.get("webserver",""),
+                                    "tech":", ".join(tr) if isinstance(tr,list) else str(tr)}
                     except: continue
             else:
-                for line in content.splitlines():
+                for line in lines:
                     line=line.strip()
                     if not line: continue
                     um=re.match(r'(https?://[^\s\[]+)',line)
@@ -2586,7 +2689,9 @@ class ScanWorker(QThread):
                     numbered=[(i,v) for i,v in enumerate(brackets) if re.match(r'^\d{3}$',v.strip())]
                     if numbered:
                         idx,status=numbered[0]; rem=[v for i,v in enumerate(brackets) if i!=idx]
-                        data[host]={"status_code":status.strip(),"title":(rem[0].strip() if rem else ""),"webserver":(rem[1].strip() if len(rem)>1 else ""),"tech":", ".join(v.strip() for v in rem[2:])}
+                        data[host]={"status_code":status.strip(),"title":(rem[0].strip() if rem else ""),
+                                    "webserver":(rem[1].strip() if len(rem)>1 else ""),
+                                    "tech":", ".join(v.strip() for v in rem[2:])}
         except Exception as e: self.log.emit(f"<span style='color:#f85149'>! httpx parse: {e}</span>")
         return data
 
@@ -2605,8 +2710,7 @@ class ScanWorker(QThread):
 # ─── HTTP status color helpers ────────────────────────────────────────────────
 def hcol(c):
     """Color based on final status code. Handles '200', '301,200', '[301,200]' formats."""
-    import re as _rhc
-    codes = _rhc.findall(r"\d{3}", str(c))
+    codes = re.findall(r"\d{3}", str(c))
     if not codes: return D["muted"]
     last = codes[-1]
     if last.startswith("2"): return D["green"]
@@ -2830,28 +2934,33 @@ class _SyncScan:
         # 3. dnsx
         self._cmd(f"dnsx -l {shlex.quote(sf)} -resp -no-color -a -cname -o {shlex.quote(df)} -silent","dnsx",shell=True)
 
-        # 4. wget last-modified — csak httpx által talált URL-ekre
+        # 4. wget last-modified — csak httpx által talált URL-ekre, párhuzamosan
         w = ScanWorker.__new__(ScanWorker)  # reuse parsers without threading
         w.log = type('L',(),{'emit':self._log})()
         hdata = w._phttpx(hf) if hasattr(w,'_phttpx') else {}
         httpx_subs=set(hdata.keys())
-        last_mod={}
-        for sub in subs:
-            if self._stopped(): break
-            if sub not in httpx_subs:
-                last_mod[sub]="N/A"
-                continue
-            val="N/A"
-            for scheme in ["https","http"]:
+        last_mod={sub:"N/A" for sub in subs}
+
+        def _wget_one(sub):
+            if self._stopped(): return sub,"N/A"
+            for scheme in ("https","http"):
                 try:
                     r=subprocess.run(
                         f'wget --server-response --spider --timeout=3 --tries=1 -q -O /dev/null "{scheme}://{sub}" 2>&1'
                         f" | grep -i 'Last-Modified:' | sed 's/^[[:space:]]*//' | cut -d' ' -f2-",
                         shell=True,capture_output=True,text=True,timeout=8)
                     v=(r.stdout or r.stderr).strip()
-                    if v: val=v; break
+                    if v: return sub,v
                 except: pass
-            last_mod[sub]=val
+            return sub,"N/A"
+
+        httpx_subs_list=[s for s in subs if s in httpx_subs]
+        max_workers=min(20,len(httpx_subs_list)) if httpx_subs_list else 1
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs={ex.submit(_wget_one,s):s for s in httpx_subs_list}
+            for fut in as_completed(futs):
+                if self._stopped(): break
+                sub,val=fut.result(); last_mod[sub]=val
 
         # 5. parse & merge
         ddata = w._pdnsx(df)  if hasattr(w,'_pdnsx') else {}
@@ -2910,50 +3019,35 @@ class ResultTable(QTableWidget):
 
     def load_db(self,db):
         self.setSortingEnabled(False); self.setUpdatesEnabled(False)
-        self.setRowCount(0); self._db=db; self._sub_rows={}; self._expanded=set()
-        for sub,rec in sorted(db.items()):
-            r=self.rowCount(); self.insertRow(r); self._sub_rows[sub]=r
-            self._fill_main_row(r, sub, rec)
+        sorted_items=sorted(db.items())
+        self.setRowCount(0)
+        self._db=db; self._sub_rows={}; self._expanded=set()
+        self.setRowCount(len(sorted_items))
+        for r,(sub,rec) in enumerate(sorted_items):
+            self._sub_rows[sub]=r
+            self._fill_main_row(r,sub,rec)
         self.setUpdatesEnabled(True)
         self._auto_fit_columns()
 
     def _auto_fit_columns(self):
-        """Oszlopszélességeket a leghosszabb tartalom alapján állítja be.
-        Minden oszlopnál végigmegy az összes soron és megméri a tartalom szélességét."""
+        """Oszlopszélességeket a tartalom alapján állítja be. Max 200 sor mintavétel."""
         hh = self.horizontalHeader()
         fm = self.fontMetrics()
-        # Max szélességek néhány oszlopnál
-        MAX_COL = {
-            C_SUB:   420,
-            C_TITLE: 320,
-            C_TECH:  300,
-            C_DVAL:  340,
-            C_LAST:  180,
-        }
-        PAD = 20  # extra padding cellánként
+        MAX_COL = {C_SUB:420,C_TITLE:320,C_TECH:300,C_DVAL:340,C_LAST:180}
+        PAD = 20
+        total = self.rowCount()
+        step = max(1, total // 200)  # Max ~200 sor mintavétel
 
         for col in range(len(COL_NAMES())):
-            if col == C_EXP:
-                continue  # Fix méretű, ne piszkáljuk
-
-            # Fejléc szöveg szélessége
+            if col == C_EXP: continue
             header_text = self.horizontalHeaderItem(col)
             best = fm.horizontalAdvance(header_text.text() if header_text else "") + PAD
-
-            # Minden sor celláját megmérjük
-            for row in range(self.rowCount()):
+            for row in range(0, total, step):
                 item = self.item(row, col)
                 if item:
-                    text = item.text()
-                    w = fm.horizontalAdvance(text) + PAD
-                    if w > best:
-                        best = w
-
-            # Min és max korlátok alkalmazása
-            min_w = COL_W[col]
-            max_w = MAX_COL.get(col, 600)
-            final_w = max(min_w, min(best, max_w))
-
+                    w = fm.horizontalAdvance(item.text()) + PAD
+                    if w > best: best = w
+            final_w = max(COL_W[col], min(best, MAX_COL.get(col, 600)))
             self.setColumnWidth(col, final_w)
             hh.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
 
@@ -3172,6 +3266,9 @@ class ResultTable(QTableWidget):
         return tgts
 
     def _pval(self,attr):
+        # Először a globális singleton-ban keressük (parent=None esetén is működik)
+        if hasattr(_AppSettings, attr):
+            return getattr(_AppSettings, attr)
         p=self.parent()
         while p:
             if hasattr(p,attr): return getattr(p,attr)
@@ -3179,10 +3276,24 @@ class ResultTable(QTableWidget):
     def _rate(self): w=self._pval('_rate'); return w.value() if w else 5
     def _ua(self):   w=self._pval('_user_agent'); return w.text().strip() if w else ""
     def _hdr(self):  w=self._pval('_req_header'); return w.text().strip() if w else ""
-    def _sudopw(self): return self._pval('_sudo_pw') or ""
+    def _sudopw(self):
+        # Először a globális singleton-ban keressük
+        if _AppSettings._sudo_pw:
+            return _AppSettings._sudo_pw
+        p = self.parent()
+        while p:
+            if hasattr(p, '_sudo_pw'): return p._sudo_pw or ""
+            p = p.parent() if hasattr(p, 'parent') else None
+        return ""
 
-    def _open(self,dlg_class,sub,*args):
-        d=dlg_class(sub,self._tgts(sub),*args,parent=self); d.setModal(False); d.show(); d.raise_()
+    def _open(self, dlg_class, sub, *args):
+        """Tool ablak megnyitása. A referenciát a globális _OPEN_DIALOGS listában tároljuk,
+        hogy a QThread ne semmisüljön meg GC által futás közben (SIGABRT megelőzése)."""
+        d = dlg_class(sub, self._tgts(sub), *args)
+        _OPEN_DIALOGS.append(d)
+        # Cleanup: ha bezárják, vegyük ki a listából
+        d.finished.connect(lambda: _OPEN_DIALOGS.discard(d) if hasattr(_OPEN_DIALOGS,'discard') else None)
+        d.show(); d.raise_()
 
     def _odig(self,sub):      self._open(DigDialog,sub)
     def _ohttpx(self,sub):    self._open(HttpxDialog,sub,self._rate(),self._ua(),self._hdr())
@@ -3199,26 +3310,26 @@ class ResultTable(QTableWidget):
 
     def apply_filters(self,filters):
         f_dt=filters.get("dns_type","")
-        # Store for use when rows are expanded
+        f_sub=filters.get("subdomain","").lower()
+        f_title=filters.get("title","").lower()
+        f_http=filters.get("http","")
+        f_ws=filters.get("ws","").lower()
+        f_tech=filters.get("tech","").lower()
+        f_dv=filters.get("dns_value","").lower()
+        f_take=filters.get("takeover",False)
         self._active_dns_filter = f_dt
 
-        # First pass: determine which subs are visible
         sub_show={}
         for sub,rec in self._db.items():
-            dns_types =[t for t,v in rec.get("dns",[])]
-            dns_vals  =[v for t,v in rec.get("dns",[])]
             show=True
-            if filters.get("subdomain","") and filters["subdomain"].lower() not in sub.lower(): show=False
-            if filters.get("title","")     and filters["title"].lower()     not in rec.get("title","").lower(): show=False
-            if filters.get("http",""):
-                import re as _rf
-                status_codes = _rf.findall(r"\d{3}", rec.get("status",""))
-                if filters["http"] not in status_codes: show=False
-            if filters.get("ws","")        and filters["ws"].lower()        not in rec.get("webserver","").lower(): show=False
-            if filters.get("tech","")      and filters["tech"].lower()      not in rec.get("tech","").lower(): show=False
-            if f_dt and f_dt not in dns_types: show=False
-            if filters.get("dns_value","") and not any(filters["dns_value"].lower() in v.lower() for v in dns_vals): show=False
-            if filters.get("takeover",False):
+            if f_sub and f_sub not in sub.lower(): show=False
+            elif f_title and f_title not in rec.get("title","").lower(): show=False
+            elif f_http and f_http not in re.findall(r"\d{3}",rec.get("status","")): show=False
+            elif f_ws and f_ws not in rec.get("webserver","").lower(): show=False
+            elif f_tech and f_tech not in rec.get("tech","").lower(): show=False
+            elif f_dt and f_dt not in [t for t,v in rec.get("dns",[])]: show=False
+            elif f_dv and not any(f_dv in v.lower() for t,v in rec.get("dns",[])): show=False
+            elif f_take:
                 is_v,_=check_takeover(rec)
                 if not is_v: show=False
             sub_show[sub]=show
@@ -3265,14 +3376,68 @@ class ResultTable(QTableWidget):
 
     def clear_all(self): self._db={}; self._sub_rows={}; self._expanded=set(); self.setRowCount(0)
 
-    def import_pipe(self, path):
-        """Import pipe-separated file back into DB and reload table."""
-        db = {}
+    def export_session(self, path, settings: dict):
+        """
+        Teljes munkamenet mentése JSON formátumban (.inscop3).
+        Tartalmazza: adatbázis, beállítások (rate, ua, header), aktív HTTP kód lista, jegyzetek.
+        """
+        # DNS rekordok sorosítása
+        records = {}
+        for sub, rec in self._db.items():
+            dns = rec.get("dns", [])
+            is_v, _ = check_takeover(rec)
+            records[sub] = {
+                "title":         rec.get("title", ""),
+                "status":        rec.get("status", ""),
+                "webserver":     rec.get("webserver", ""),
+                "tech":          rec.get("tech", ""),
+                "last_modified": rec.get("last_modified", "N/A"),
+                "takeover":      is_v,
+                "dns":           [[t, v] for t, v in dns],
+            }
+        payload = {
+            "version":  3,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "settings": settings,       # rate, ua, header
+            "records":  records,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    def import_session(self, path):
+        """
+        Munkamenet betöltése .inscop3 (JSON) fájlból.
+        Visszaad: (db_dict, settings_dict, notes_str, http_codes_list, error_str|None)
+        """
         try:
             with open(path, encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
-            # Skip header if present
+                raw = f.read().strip()
+
+            # ── JSON munkamenet (.inscop3) ──────────────────────────────────
+            if raw.startswith("{"):
+                payload = json.loads(raw)
+                settings = payload.get("settings", {})
+                notes    = settings.pop("notes", "")
+                http_codes = settings.pop("http_codes", [])
+                records  = payload.get("records", {})
+                db = {}
+                for sub, r in records.items():
+                    db[sub] = {
+                        "subdomain":     sub,
+                        "title":         r.get("title", ""),
+                        "status":        r.get("status", ""),
+                        "webserver":     r.get("webserver", ""),
+                        "tech":          r.get("tech", ""),
+                        "last_modified": r.get("last_modified", "N/A"),
+                        "dns":           [tuple(x) for x in r.get("dns", [])],
+                    }
+                self.load_db(db)
+                return db, settings, notes, http_codes, None
+
+            # ── Régi pipe-formátum (visszafelé-kompatibilis) ────────────────
+            lines = raw.splitlines()
             start = 1 if lines and lines[0].startswith("subdomain|") else 0
+            db = {}
             for line in lines[start:]:
                 line = line.rstrip("\n")
                 if not line.strip(): continue
@@ -3286,12 +3451,11 @@ class ResultTable(QTableWidget):
                 tech      = uesc(parts[4])
                 last_mod  = uesc(parts[5])
                 dns_raw   = parts[6].strip()
-                # Parse dns_records: ip1(A);ip2(A);cname(CNAME)
                 dns = []
                 if dns_raw and dns_raw != "\t":
                     for entry in dns_raw.split(";"):
                         entry = entry.strip()
-                        m = __import__("re").match(r"^(.+)\((\w+)\)$", entry)
+                        m = re.match(r"^(.+)\((\w+)\)$", entry)
                         if m:
                             dns.append((m.group(2), m.group(1)))
                 if not sub: continue
@@ -3300,44 +3464,37 @@ class ResultTable(QTableWidget):
                     "webserver": webserver, "tech": tech,
                     "dns": dns, "last_modified": last_mod,
                 }
+            self.load_db(db)
+            return db, {}, "", [], None
+
         except Exception as e:
-            return False, str(e)
-        self.load_db(db)
-        return True, T("file.import_ok",msg=f"{len(db)} entries loaded")
+            return {}, {}, "", [], str(e)
+
+    def import_pipe(self, path):
+        """Visszafelé-kompatibilis wrapper — régi pipe betöltés."""
+        db, _, _, _, err = self.import_session(path)
+        if err:
+            return False, err
+        return True, T("file.import_ok", msg=f"{len(db)} entries loaded")
 
     def export_pipe(self, path):
         """
-        Pipe-separated export format:
+        Régi pipe-separated export (megtartva visszafelé-kompatibilitáshoz).
         subdomain|title|http|webserver|tech|last_modified|dns_records|takeover
-        dns_records: ip1(A);ip2(A);cname1(CNAME)
-        title spaces replaced with +, | in title escaped as [pipe]
-        takeover: 1 or 0
         """
         def esc(s):
-            """Replace spaces with + and | with [pipe] in field values."""
             return str(s).replace("|", "[pipe]").replace(" ", "+")
-
         with open(path, "w", encoding="utf-8") as f:
-            # Header line
             f.write("subdomain|title|http|webserver|tech|last_modified|dns_records|takeover\n")
             for sub, rec in sorted(self._db.items()):
                 dns = rec.get("dns", [])
                 is_v, _ = check_takeover(rec)
-                # Build DNS records field: ip1(A);ip2(A);cname(CNAME)
-                if dns:
-                    dns_field = ";".join(f"{v}({t})" for t, v in dns)
-                else:
-                    dns_field = "\t"
-                # Build each field — tab if empty
+                dns_field = ";".join(f"{v}({t})" for t, v in dns) if dns else "\t"
                 def f_(v): return esc(v) if str(v).strip() else "\t"
                 line = "|".join([
-                    f_(sub),
-                    f_(rec.get("title","")),
-                    f_(rec.get("status","")),
-                    f_(rec.get("webserver","")),
-                    f_(rec.get("tech","")),
-                    f_(rec.get("last_modified","N/A")),
-                    dns_field,
+                    f_(sub), f_(rec.get("title","")), f_(rec.get("status","")),
+                    f_(rec.get("webserver","")), f_(rec.get("tech","")),
+                    f_(rec.get("last_modified","N/A")), dns_field,
                     "1" if is_v else "0",
                 ])
                 f.write(line + "\n")
@@ -3567,7 +3724,7 @@ class FfufDialog(BaseToolDialog):
                 ("-request-proto","Protocol for raw request (http/https)",           True, "https",                    False),
             ]),
             ("MATCHER OPTIONS",[
-                ("-mc",         "Match HTTP status codes (default: 200-299,301,302,307,401,403,405,500)", True, "200,301,302", False),
+                ("-mc",         "Match HTTP status codes (default: 200-299,301,302,307,401,403,405,500)", True, "200", True),
                 ("-ms",         "Match HTTP response size",                          True, "1234",                     False),
                 ("-ml",         "Match amount of lines in response",                 True, "10",                       False),
                 ("-mw",         "Match amount of words in response",                 True, "5",                        False),
@@ -3595,7 +3752,7 @@ class FfufDialog(BaseToolDialog):
                 ("-ach",        "Per-host autocalibration",                          False,"",                         False),
                 ("-ack",        "Autocalibration keyword",                           True, "FUZZ",                     False),
                 ("-acs",        "Custom auto-calibration strategies (implies -ac)",  True, "",                         False),
-                ("-c",          "Colorize output",                                   False,"",                         False),
+                ("-c",          "Colorize output",                                   False,"",                         True),   # alapból BE
                 ("-v",          "Verbose output (full URL + redirect location)",     False,"",                         False),
                 ("-s",          "Silent mode (no additional info)",                  False,"",                         False),
                 ("-json",       "JSON output (newline-delimited)",                   False,"",                         False),
@@ -3619,8 +3776,10 @@ class FfufDialog(BaseToolDialog):
         ]
         for sec, flags in sections:
             self._ol.addWidget(self._sec(sec))
-            for flag,h,hv,ph,browse in flags:
-                cb,le=self._add_flag(self._ol,flag,h,hv,ph,False,"",browse)
+            for flag,h,hv,ph,defon in flags:
+                # OUTPUT opciók mind kikapcsolt alapból (fájl nem kell, konzol elég)
+                actual_defon = defon if flag not in ("-o","-of","-od","-or","-debug-log","-audit-log","-cc","-ck","-request","-config","-scraperfile") else False
+                cb,le=self._add_flag(self._ol,flag,h,hv,ph,actual_defon,"",ph if flag in ("-cc","-ck","-w","-request","-config","-scraperfile","-o","-od","-debug-log","-audit-log") else False)
                 if flag=="-H" and (self._hdr or self._ua) and le:
                     parts=[]
                     if self._hdr: parts.append(f'"{self._hdr}"')
@@ -3639,6 +3798,78 @@ class FfufDialog(BaseToolDialog):
                 p.append(f)
                 if le and le.text().strip(): p.append(le.text().strip())
         return " ".join(p)
+
+    def _run(self):
+        """Override: FfufCmdWorker-t használ a batch/throttled output miatt."""
+        if self._rbtn.text().startswith("⏹"):
+            if hasattr(self,'_worker') and self._worker: self._worker.stop()
+            self._rbtn.setText(T("btn.start")); self._rbtn.setStyleSheet(BRUN); return
+        cmd=self._cedit.text().strip() or self._build_cmd()
+        self._out.clear()
+        self._out.insertHtml(f"<span style='color:{D['muted']}'>$ {_html.escape(cmd)}</span><br><br>")
+        # Progress label (terminál-szerű: csak az utolsó progress sort mutatja)
+        if not hasattr(self, '_prog_label'):
+            self._prog_label = QLabel("")
+            self._prog_label.setStyleSheet(f"color:{D['muted']};font-size:11px;font-family:monospace;padding:2px 4px;")
+            self._root.insertWidget(self._root.count()-1, self._prog_label)
+        self._prog_label.setText("")
+        self._rbtn.setText(T("btn.stop")); self._rbtn.setStyleSheet(BSTOP)
+        try: parts=shlex.split(cmd)
+        except: parts=cmd.split()
+        self._worker=FfufCmdWorker(parts)
+        self._worker.batch_output.connect(self._on_batch_out)
+        self._worker.finished.connect(self._on_done)
+        self._worker.start()
+
+    def _on_batch_out(self, lines):
+        """Batch output handler ffuf-hoz.
+        - Progress sorok (\x1b[2K vagy :: Progress:) → csak az utolsót tartja meg,
+          és egy dedikált progress label-ben mutatja (nem a fő outputban).
+        - Hit sorok (Status:) → a fő outputban megjelennek.
+        - Egyéb (fejléc, info) → normálisan megjelenik.
+        """
+        last_progress = None
+        html_parts = []
+
+        for line in lines:
+            # ANSI escape szekvenciák eltávolítása a vizsgálathoz
+            clean = _re_ansi.sub(r'\x1b\[[0-9;]*m', '', line)
+            clean = clean.replace('\r', '').replace('\x1b[2K', '').strip()
+
+            # Progress sor: :: Progress: [...] formátum
+            if clean.startswith(':: Progress:') or '\x1b[2K' in line or line.startswith('\r'):
+                last_progress = clean if clean.startswith('::') else (last_progress or clean)
+                continue
+
+            # Üres sor
+            if not clean:
+                html_parts.append("<br>"); continue
+
+            # ANSI konverzió ha van benne szín
+            raw_stripped = _re_ansi.sub(r'\x1b\[[0-9;]*m', '', line)
+            if raw_stripped != line:
+                html_parts.append(ansi_to_html(line) + "<br>")
+                continue
+
+            # Szín-kódolás ANSI nélkül
+            safe = _html.escape(clean)
+            if re.search(r'\b(200|201|204)\b', clean): color = D['green']
+            elif re.search(r'\b(301|302|303|307|308)\b', clean): color = "#79c0ff"
+            elif re.search(r'\b(401|403)\b', clean): color = D['orange']
+            elif re.search(r'\b(404)\b', clean): color = D['red']
+            elif re.search(r'\b(500|502|503)\b', clean): color = "#ff6b6b"
+            elif clean.startswith('::') or '[INFO]' in clean: color = D['muted']
+            elif '[Warning]' in clean or '[WARN]' in clean: color = D['orange']
+            elif '[ERR]' in clean or '[ERROR]' in clean: color = D['red']
+            else: color = D['text2']
+            html_parts.append(f"<span style='color:{color}'>{safe}</span><br>")
+
+        # Progress label frissítése (az utolsó progress sort mutatja)
+        if last_progress and hasattr(self, '_prog_label'):
+            self._prog_label.setText(last_progress)
+
+        if html_parts:
+            self._out.insertHtml("".join(html_parts))
 
 
 # ─── Katana Dialog ────────────────────────────────────────────────────────────
@@ -3873,13 +4104,12 @@ class MainWindow(QMainWindow):
         # Load SVG icon same as browse buttons
         from PyQt6.QtGui import QIcon as _QIcon
         from PyQt6.QtCore import QSize as _QSize
-        import os as _os
-        _svg = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "folder-activities.svg")
-        if not _os.path.exists(_svg):
-            for _d in [_os.path.expanduser("~/.local/share/inscop3"), _os.path.dirname(_os.path.abspath(__file__))]:
-                _c = _os.path.join(_d, "folder-activities.svg")
-                if _os.path.exists(_c): _svg = _c; break
-        if _os.path.exists(_svg):
+        _svg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "folder-activities.svg")
+        if not os.path.exists(_svg):
+            for _d in [os.path.expanduser("~/.local/share/inscop3"), os.path.dirname(os.path.abspath(__file__))]:
+                _c = os.path.join(_d, "folder-activities.svg")
+                if os.path.exists(_c): _svg = _c; break
+        if os.path.exists(_svg):
             scope_btn.setIcon(_QIcon(_svg)); scope_btn.setIconSize(_QSize(20,20))
         else:
             # Fallback: text icon, colored blue
@@ -3893,6 +4123,10 @@ class MainWindow(QMainWindow):
         self._user_agent=inp(); self._user_agent.setPlaceholderText("Mozilla/5.0 ..."); sb.addWidget(self._user_agent)
         sb.addWidget(gap()); sb.addWidget(lbl(T("main.hdr_label")))
         self._req_header=inp(); self._req_header.setPlaceholderText("X-Intigriti-Username: user"); sb.addWidget(self._req_header)
+        # Regisztrálás a globális singleton-ban, hogy parent=None ablakok is elérjék
+        _AppSettings._rate = self._rate
+        _AppSettings._user_agent = self._user_agent
+        _AppSettings._req_header = self._req_header
         sb.addWidget(gap(10))
         self._rbtn=QPushButton(T("btn.scan_start")); self._rbtn.setStyleSheet(BRUN); self._rbtn.setFixedHeight(40); self._rbtn.clicked.connect(self._start); sb.addWidget(self._rbtn)
         sb.addWidget(gap(5))
@@ -3929,9 +4163,9 @@ class MainWindow(QMainWindow):
         sb.addWidget(hdiv())
         # EXPORT / IMPORT
         sb.addWidget(sec("EXPORT / IMPORT"))
-        exp=QPushButton(T("btn.export")); exp.setStyleSheet(BGRN); exp.setFixedHeight(34); exp.clicked.connect(self._export); sb.addWidget(exp)
+        exp=QPushButton("💾   Munkamenet mentése"); exp.setStyleSheet(BGRN); exp.setFixedHeight(34); exp.clicked.connect(self._export); sb.addWidget(exp)
         sb.addWidget(gap(5))
-        imp_btn=QPushButton("⬆   Import (pipe .txt)"); imp_btn.setStyleSheet(BMUT); imp_btn.setFixedHeight(34); imp_btn.clicked.connect(self._import_data); sb.addWidget(imp_btn)
+        imp_btn=QPushButton("📂   Munkamenet betöltése"); imp_btn.setStyleSheet(BMUT); imp_btn.setFixedHeight(34); imp_btn.clicked.connect(self._import_data); sb.addWidget(imp_btn)
         sb.addWidget(gap(5)); clrt=QPushButton(T("btn.clear_table")); clrt.setStyleSheet(BMUT); clrt.setFixedHeight(34); clrt.clicked.connect(self._clrt); sb.addWidget(clrt)
         sb.addStretch()
         ch.addWidget(sbs)
@@ -3956,7 +4190,10 @@ class MainWindow(QMainWindow):
         return l
 
     def _log(self,html):
-        self._lv.insertHtml(html+"<br>"); self._lv.verticalScrollBar().setValue(self._lv.verticalScrollBar().maximum())
+        sb=self._lv.verticalScrollBar()
+        at_bottom=sb.value()>=sb.maximum()-4
+        self._lv.insertHtml(html+"<br>")
+        if at_bottom: sb.setValue(sb.maximum())
 
     def _import_scope(self):
         """Open a scope file (bug bounty txt), parse it, show summary, then start batch scan."""
@@ -4021,6 +4258,7 @@ class MainWindow(QMainWindow):
         if dlg.exec()!=QDialog.DialogCode.Accepted: return
         rate=self._rate.value(); ua=self._user_agent.text().strip(); hdr=self._req_header.text().strip()
         self._sudo_pw = dlg.password  # store for tool dialogs
+        _AppSettings._sudo_pw = self._sudo_pw
         self._n=0; self._table.clear_all(); self._lv.clear(); self._prog.setValue(0)
         self._rbtn.setEnabled(False); self._sbtn.setEnabled(True); self._badge.setText("0 host")
         ts=datetime.now().strftime('%Y%m%d_%H%M%S'); safe=re.sub(r'[^a-zA-Z0-9._-]','_',domain)
@@ -4035,7 +4273,8 @@ class MainWindow(QMainWindow):
     def _open_notes(self):
         """Nyissa meg a főablakból a Jegyzet dialógust."""
         if not hasattr(self, "_notes_dialog") or self._notes_dialog is None:
-            self._notes_dialog = NotesDialog(self)
+            self._notes_dialog = NotesDialog()
+            _OPEN_DIALOGS.append(self._notes_dialog)
         self._notes_dialog.show()
         self._notes_dialog.raise_()
         self._notes_dialog.activateWindow()
@@ -4054,13 +4293,11 @@ class MainWindow(QMainWindow):
 
     def _update_http_filter_options(self, db):
         """Update HTTP filter combo box with only existing status codes"""
-        import re as _rfhc
-        
         # Extract all unique HTTP status codes from database
         codes = set()
         for rec in db.values():
             status = rec.get("status", "")
-            found = _rfhc.findall(r"\d{3}", str(status))
+            found = re.findall(r"\d{3}", str(status))
             codes.update(found)
         
         # Sort codes numerically
@@ -4097,24 +4334,68 @@ class MainWindow(QMainWindow):
     def _clrt(self): self._table.clear_all(); self._n=0; self._badge.setText(T("scan.0hosts"))
 
     def _export(self):
-        path,_=QFileDialog.getSaveFileName(self,T("file.pipe_save"),
-            f"wcrecon_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+        path, _ = QFileDialog.getSaveFileName(
+            self, T("file.pipe_save"),
+            f"inscop3_{datetime.now().strftime('%Y%m%d_%H%M%S')}.inscop3",
             T("file.pipe_filter"))
-        if path:
-            self._table.export_pipe(path)
-            self._log(f"<span style='color:{D["green"]}'>✓ Mentve: {path}</span>")
+        if not path: return
+        # Aktív HTTP kódok összegyűjtése a comboboxból
+        http_codes = [self._f_http.itemText(i)
+                      for i in range(1, self._f_http.count())]  # 0 = "Minden"
+        settings = {
+            "rate":       self._rate.value(),
+            "ua":         self._user_agent.text().strip(),
+            "header":     self._req_header.text().strip(),
+            "notes":      GlobalNotes().get(),
+            "http_codes": http_codes,
+        }
+        try:
+            self._table.export_session(path, settings)
+            self._log(f"<span style='color:{D['green']}'>✓ Munkamenet mentve: {path}</span>")
+        except Exception as e:
+            self._log(f"<span style='color:{D['red']}'>✗ Mentési hiba: {e}</span>")
 
     def _import_data(self):
-        path,_=QFileDialog.getOpenFileName(self,T("file.pipe_open"),"",
-            T("file.pipe_filter"))
-        if path:
-            ok,msg=self._table.import_pipe(path)
-            if ok:
-                self._n=len(self._table._db)
-                self._badge.setText(f"{self._n} host")
-                self._log(f"<span style='color:{D['green']}'>{T('file.import_ok',msg=msg)}</span>")
-            else:
-                self._log(f"<span style='color:{D["red"]}'>✗ Import hiba: {msg}</span>")
+        path, _ = QFileDialog.getOpenFileName(
+            self, T("file.pipe_open"), "",
+            "InScop3 munkamenet (*.inscop3);;Pipe-separated TXT (*.txt);;Minden fájl (*)")
+        if not path: return
+        db, settings, notes, http_codes, err = self._table.import_session(path)
+        if err:
+            self._log(f"<span style='color:{D['red']}'>✗ Betöltési hiba: {err}</span>")
+            return
+
+        # ── Adatbázis ───────────────────────────────────────────────────────
+        self._n = len(db)
+        self._badge.setText(T("scan.n_hosts", n=self._n))
+        self._sright.setText(T("scan.n_sub", n=self._n))
+
+        # ── Beállítások visszaállítása ───────────────────────────────────────
+        if settings.get("rate") is not None:
+            self._rate.setValue(int(settings["rate"]))
+        if settings.get("ua"):
+            self._user_agent.setText(settings["ua"])
+        if settings.get("header"):
+            self._req_header.setText(settings["header"])
+
+        # ── HTTP kód szűrő visszaállítása ────────────────────────────────────
+        if http_codes:
+            self._f_http.currentTextChanged.disconnect(self._filter)
+            self._f_http.clear()
+            self._f_http.addItems([T("main.f_all")] + http_codes)
+            self._f_http.currentTextChanged.connect(self._filter)
+        else:
+            # Ha nincs elmentett lista, generáljuk az adatbázisból
+            self._update_http_filter_options(db)
+
+        # ── Jegyzetek visszaállítása ─────────────────────────────────────────
+        if notes:
+            GlobalNotes().set(notes)
+
+        self._log(f"<span style='color:{D['green']}'>✓ Munkamenet betöltve: {self._n} host"
+                  + (f", beállítások visszaállítva" if settings else "")
+                  + (f", jegyzetek visszaállítva" if notes else "")
+                  + "</span>")
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 # ─── Language Selection Dialog ────────────────────────────────────────────────
