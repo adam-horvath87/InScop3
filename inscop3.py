@@ -2565,7 +2565,7 @@ def parse_scope_file(path):
         if any(skip in target for skip in ["apple.com", "play.google.com", "github.com"]):
             continue
         # Must look like a domain
-        if not _re.search(r"\.[a-z]{2,}$", target, _re.I):
+        if not re.search(r"\.[a-z]{2,}$", target, re.I):
             continue
 
         if target not in seen:
