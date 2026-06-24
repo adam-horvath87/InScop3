@@ -189,6 +189,10 @@ _TRANSLATIONS = {
     "file.import_ok":    {"hu": "✓ Betöltve: {msg}",  "en": "✓ Loaded: {msg}"},
     "file.import_err":   {"hu": "✗ Betöltési hiba: {msg}", "en": "✗ Load error: {msg}"},
     "file.save_ok":      {"hu": "✓ Mentve: {path}",   "en": "✓ Saved: {path}"},
+    "btn.session_save":  {"hu": "💾   Munkamenet mentése", "en": "💾   Save session"},
+    "btn.session_load":  {"hu": "📂   Munkamenet betöltése", "en": "📂   Load session"},
+    "tool.fs_expand":    {"hu": "Kimenet teljes képernyő / visszaállítás", "en": "Fullscreen output / restore"},
+    "tool.fs_restore":   {"hu": "Visszaállítás", "en": "Restore"},
     # ── Missing domain warning ────────────────────────────────────────────────
     "warn.no_domain_title":{"hu": "Hiányzó adat",      "en": "Missing data"},
     "warn.no_domain_msg":  {"hu": "Add meg a domain nevet!","en": "Please enter a domain name!"},
@@ -754,10 +758,30 @@ class SearchableOutput(QWidget):
         next_b=QPushButton(T("search.next")); next_b.setFixedHeight(26); next_b.setStyleSheet(BMUT); next_b.setToolTip(T("search.next_tip")); next_b.clicked.connect(self._next); sb.addWidget(next_b)
         lay.addLayout(sb)
 
-    def insertHtml(self,h):
+    def insertHtml(self, h):
         with self._output_lock:
-            self.edit.insertHtml(h)
-        sb=self.edit.verticalScrollBar(); sb.setValue(sb.maximum())
+            e = self.edit
+            tc = e.textCursor()
+            has_selection = tc.hasSelection()
+            # Ha van kijelölés, elmentjük és a végére ugrunk az insert előtt
+            if has_selection:
+                sel_start = tc.selectionStart()
+                sel_end   = tc.selectionEnd()
+                # Insert a dokumentum végére anélkül hogy a kijelölést elveszítenénk
+                end_cur = e.textCursor()
+                end_cur.movePosition(QTextCursor.MoveOperation.End)
+                e.setTextCursor(end_cur)
+                e.insertHtml(h)
+                # Visszaállítjuk a kijelölést
+                restore = e.textCursor()
+                restore.setPosition(sel_start)
+                restore.setPosition(sel_end, QTextCursor.MoveMode.KeepAnchor)
+                e.setTextCursor(restore)
+                # Nem scrollolunk — a felhasználó épp olvas/másol
+            else:
+                e.insertHtml(h)
+                sb = e.verticalScrollBar()
+                sb.setValue(sb.maximum())
     def append(self,t): self.edit.append(t)
     def clear(self):    self.edit.clear(); self._clear()
     def setPlaceholderText(self,t): self.edit.setPlaceholderText(t)
@@ -883,7 +907,7 @@ class BaseToolDialog(QDialog):
         # Fullscreen gomb — float overlay a jobb alsó sarokba
         self._fs_btn = QPushButton("⛶", out_container)
         self._fs_btn.setFixedSize(22, 22)
-        self._fs_btn.setToolTip("Kimenet teljes képernyő / visszaállítás")
+        self._fs_btn.setToolTip(T("tool.fs_expand"))
         self._fs_btn.setStyleSheet(
             f"QPushButton{{background:rgba(30,30,40,200);color:{D['muted']};border:1px solid {D['border']};"
             f"border-radius:4px;font-size:12px;padding:0;}}"
@@ -1151,7 +1175,7 @@ class BaseToolDialog(QDialog):
                     if sub and sub.widget():
                         sub.widget().setVisible(not self._fs_mode)
         self._fs_btn.setText("✕" if self._fs_mode else "⛶")
-        self._fs_btn.setToolTip("Visszaállítás" if self._fs_mode else "Kimenet teljes képernyő / visszaállítás")
+        self._fs_btn.setToolTip(T("tool.fs_restore") if self._fs_mode else T("tool.fs_expand"))
         # Scroll area max magasság eltávolítása/visszaállítása
         if hasattr(self, '_osc'):
             self._osc.setMaximumHeight(16777215 if self._fs_mode else 310)
@@ -4177,9 +4201,9 @@ class MainWindow(QMainWindow):
         sb.addWidget(hdiv())
         # EXPORT / IMPORT
         sb.addWidget(sec("EXPORT / IMPORT"))
-        exp=QPushButton("💾   Munkamenet mentése"); exp.setStyleSheet(BGRN); exp.setFixedHeight(34); exp.clicked.connect(self._export); sb.addWidget(exp)
+        exp=QPushButton(T("btn.session_save")); exp.setStyleSheet(BGRN); exp.setFixedHeight(34); exp.clicked.connect(self._export); sb.addWidget(exp)
         sb.addWidget(gap(5))
-        imp_btn=QPushButton("📂   Munkamenet betöltése"); imp_btn.setStyleSheet(BMUT); imp_btn.setFixedHeight(34); imp_btn.clicked.connect(self._import_data); sb.addWidget(imp_btn)
+        imp_btn=QPushButton(T("btn.session_load")); imp_btn.setStyleSheet(BMUT); imp_btn.setFixedHeight(34); imp_btn.clicked.connect(self._import_data); sb.addWidget(imp_btn)
         sb.addWidget(gap(5)); clrt=QPushButton(T("btn.clear_table")); clrt.setStyleSheet(BMUT); clrt.setFixedHeight(34); clrt.clicked.connect(self._clrt); sb.addWidget(clrt)
         sb.addStretch()
         ch.addWidget(sbs)
@@ -4365,14 +4389,14 @@ class MainWindow(QMainWindow):
         }
         try:
             self._table.export_session(path, settings)
-            self._log(f"<span style='color:{D['green']}'>✓ Munkamenet mentve: {path}</span>")
+            self._log(f"<span style='color:{D['green']}'>{T('file.save_ok', path=path)}</span>")
         except Exception as e:
             self._log(f"<span style='color:{D['red']}'>✗ Mentési hiba: {e}</span>")
 
     def _import_data(self):
         path, _ = QFileDialog.getOpenFileName(
             self, T("file.pipe_open"), "",
-            "InScop3 munkamenet (*.inscop3);;Pipe-separated TXT (*.txt);;Minden fájl (*)")
+            T("file.pipe_filter") + ";;Pipe-separated TXT (*.txt);;"+("Minden fájl (*)" if _LANG.lang=="hu" else "All files (*)"))
         if not path: return
         db, settings, notes, http_codes, err = self._table.import_session(path)
         if err:
