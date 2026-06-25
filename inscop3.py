@@ -34,6 +34,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint, QSize
 from PyQt6.QtGui import (
     QFont, QColor, QPalette, QFontDatabase, QAction,
     QCursor, QGuiApplication, QTextCharFormat, QTextCursor,
+    QTextDocument, QKeySequence, QShortcut,
 )
 
 # ─── Language / Translation system ───────────────────────────────────────────
@@ -90,7 +91,7 @@ _TRANSLATIONS = {
     # ── Notes ─────────────────────────────────────────────────────────────────
     "notes.title":       {"hu": "📝 Jegyzet — InScop3 Recon","en": "📝 Notes — InScop3 Recon"},
     "notes.save_title":  {"hu": "Jegyzet mentése",      "en": "Save notes"},
-    "notes.save_filter": {"hu": "Szöveg fájlok (*.txt);;Minden fájl (*)","en": "Text files (*.txt);;All files (*)"},
+    "notes.save_filter": {"hu": "HTML fájlok (*.html);;Szöveg fájlok (*.txt);;Minden fájl (*)","en": "HTML files (*.html);;Text files (*.txt);;All files (*)"},
     "notes.toggle_tip":  {"hu": "Jegyzet megnyitása / bezárása","en": "Open / close notes"},
     "notes.bold":        {"hu": "Félkövér",             "en": "Bold"},
     "notes.italic":      {"hu": "Dőlt",                 "en": "Italic"},
@@ -359,23 +360,37 @@ class GlobalNotes:
                 if cls._inst is None:
                     o = super().__new__(cls)
                     o._content = ""
+                    o._html    = ""
                     o._custom_path = None
                     o._default_dir = os.path.expanduser("~/.local/share/inscop3")
                     o._observers = []
+                    o._html_observers = []
                     o._timer = None
-                    # _load() szándékosan nincs meghívva — minden indításkor üres notes
                     cls._inst = o
+                    # NEM hívjuk _load()-ot — mindig üres induláskor
         return cls._inst
 
     @property
     def default_path(self):
         return os.path.join(self._default_dir, "notes.txt")
 
+    @property
+    def default_html_path(self):
+        return os.path.join(self._default_dir, "notes.html")
+
     def _load(self):
+        """HTML betöltés (előnyben), fallback plain txt."""
         try:
+            if os.path.exists(self.default_html_path):
+                with open(self.default_html_path, "r", encoding="utf-8") as f:
+                    self._html = f.read()
+                # Sima szöveg kinyerése
+                self._content = re.sub(r'<[^>]+>', '', self._html)
+                return
             if os.path.exists(self.default_path):
                 with open(self.default_path, "r", encoding="utf-8") as f:
                     self._content = f.read()
+                self._html = ""
         except Exception:
             pass
 
@@ -390,14 +405,36 @@ class GlobalNotes:
     def get(self):
         return self._content
 
+    def get_html(self):
+        return self._html
+
     def set(self, text, source=None):
-        """Tartalom frissítése és broadcast – csak az összes többi ablaknak."""
+        """Sima szöveges tartalom frissítése (visszafelé-kompatibilis)."""
         self._content = text
         for cb in self._observers:
             if cb is not source:
                 try: cb(text)
                 except Exception: pass
         self._schedule_save()
+
+    def set_html(self, html, source=None):
+        """HTML tartalom frissítése és broadcast."""
+        self._html = html
+        # Sima szöveg kinyerése is (mentéshez, export-hoz)
+        import html as _h
+        self._content = re.sub(r'<[^>]+>', '', html)
+        for cb in self._html_observers:
+            if cb is not source:
+                try: cb(html)
+                except Exception: pass
+        self._schedule_save()
+
+    def register_html(self, cb):
+        if cb not in self._html_observers:
+            self._html_observers.append(cb)
+
+    def unregister_html(self, cb):
+        self._html_observers = [x for x in self._html_observers if x is not cb]
 
     def _schedule_save(self):
         if self._timer:
@@ -409,22 +446,25 @@ class GlobalNotes:
         self._timer.start(1200)
 
     def _autosave(self):
-        try:
-            os.makedirs(self._default_dir, exist_ok=True)
-            with open(self.default_path, "w", encoding="utf-8") as f:
-                f.write(self._content)
-        except Exception: pass
+        """A munkamenet-autosave csak a _custom_path-ba ír (ha van).
+        A notes.html-t szándékosan NEM írja — induláskor üres a jegyzet,
+        a tartalom csak session (.inscop3) fájlba kerül."""
         if self._custom_path:
             try:
+                content = self._html if self._html else self._content
                 with open(self._custom_path, "w", encoding="utf-8") as f:
-                    f.write(self._content)
+                    f.write(content)
             except Exception: pass
 
     def save_as(self, path):
         self._custom_path = path
         try:
+            if path.lower().endswith(".html"):
+                content = self._html if self._html else self._content
+            else:
+                content = self._content
             with open(path, "w", encoding="utf-8") as f:
-                f.write(self._content)
+                f.write(content)
             return True, f"Mentve: {path}"
         except Exception as e:
             return False, str(e)
@@ -433,6 +473,20 @@ class GlobalNotes:
 # ─── Shared Notes Editor Widget ───────────────────────────────────────────────
 class NotesEditor(QWidget):
     """Újrafelhasználható szövegszerkesztő widget — GlobalNotes-hoz kötve."""
+
+    # Alap színpaletta — előtér és háttér színek
+    FG_COLORS = [
+        ("#f85149", "Piros"),    ("#ff9500", "Narancs"),  ("#ffd60a", "Sárga"),
+        ("#7ee787", "Zöld"),     ("#79c0ff", "Kék"),       ("#d2a8ff", "Lila"),
+        ("#f0f6fc", "Fehér"),    ("#8b949e", "Szürke"),
+    ]
+    BG_COLORS = [
+        ("#3d1f1f", "Sötét piros bg"),  ("#3d2b00", "Sötét narancs bg"),
+        ("#2d2a00", "Sötét sárga bg"),  ("#1a2e1a", "Sötét zöld bg"),
+        ("#1a2535", "Sötét kék bg"),    ("#2a1f3d", "Sötét lila bg"),
+        ("#21262d", "Sötét bg"),        ("#00000000","Nincs háttér"),
+    ]
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._notes = GlobalNotes()
@@ -491,41 +545,177 @@ class NotesEditor(QWidget):
         tbl.addSpacing(4)
         _tbtn("↶", T("notes.undo"), self._undo)
         _tbtn("↷", T("notes.redo"), self._redo)
+
+        tbl.addSpacing(8)
+
+        # ── Szín-paletta: előtér (A◼) + háttér (◼) gombok ──────────────────
+        def _color_swatch(color, tip, fn):
+            """Kis négyzetgomb egy adott színnel."""
+            b = QPushButton()
+            b.setFixedSize(18, 18)
+            b.setToolTip(tip)
+            if color == "#00000000":
+                # Átlátszó / nincs — X-szel jelöljük
+                b.setText("✕")
+                b.setStyleSheet(
+                    f"QPushButton{{background:{D['surf']};color:{D['text2']};"
+                    f"border:1px solid {D['border']};border-radius:2px;font-size:9px;}}"
+                    f"QPushButton:hover{{border-color:{D['acc']};}}"
+                )
+            else:
+                b.setStyleSheet(
+                    f"QPushButton{{background:{color};border:1px solid rgba(255,255,255,0.15);"
+                    f"border-radius:2px;}}"
+                    f"QPushButton:hover{{border:2px solid #fff;}}"
+                )
+            b.clicked.connect(fn)
+            tbl.addWidget(b)
+            return b
+
+        # Előtér szín label
+        fg_lbl = QLabel("A")
+        fg_lbl.setStyleSheet(f"color:{D['muted']};font-size:10px;font-weight:bold;")
+        fg_lbl.setFixedWidth(12)
+        tbl.addWidget(fg_lbl)
+
+        for color, tip in self.FG_COLORS:
+            _color_swatch(color, tip, lambda c=color: self._apply_fg_color(c))
+
+        tbl.addSpacing(6)
+
+        # Háttér szín label
+        bg_lbl = QLabel("▣")
+        bg_lbl.setStyleSheet(f"color:{D['muted']};font-size:10px;")
+        bg_lbl.setFixedWidth(12)
+        tbl.addWidget(bg_lbl)
+
+        for color, tip in self.BG_COLORS:
+            _color_swatch(color, tip, lambda c=color: self._apply_bg_color(c))
+
         tbl.addStretch()
+
+        # ── Inline keresőmező a toolbar jobb oldalán ─────────────────────────
+        self._tb_search = QLineEdit()
+        self._tb_search.setPlaceholderText("🔍 Keresés…")
+        self._tb_search.setFixedWidth(160)
+        self._tb_search.setStyleSheet(
+            f"QLineEdit{{background:{D['surf']};color:{D['text2']};border:1px solid {D['border']};"
+            f"border-radius:3px;padding:2px 6px;font-size:11px;}}"
+            f"QLineEdit:focus{{border-color:{D['acc']};}}"
+        )
+        self._tb_search.textChanged.connect(self._search_notes)
+        self._tb_search.returnPressed.connect(self._search_next)
+        tbl.addWidget(self._tb_search)
+
+        self._tb_search_lbl = QLabel("")
+        self._tb_search_lbl.setStyleSheet(f"color:{D['muted']};font-size:10px;min-width:44px;")
+        tbl.addWidget(self._tb_search_lbl)
+
+        tb_prev = QPushButton("↑"); tb_prev.setFixedSize(22,22); tb_prev.setToolTip("Előző (Shift+Enter)")
+        tb_prev.setStyleSheet(
+            f"QPushButton{{background:{D['surf']};color:{D['text2']};border:1px solid {D['border']};border-radius:3px;}}"
+            f"QPushButton:hover{{background:{D['acc']};color:#fff;border-color:{D['acc']};}}"
+        )
+        tb_prev.clicked.connect(self._search_prev); tbl.addWidget(tb_prev)
+
+        tb_next = QPushButton("↓"); tb_next.setFixedSize(22,22); tb_next.setToolTip("Következő (Enter)")
+        tb_next.setStyleSheet(
+            f"QPushButton{{background:{D['surf']};color:{D['text2']};border:1px solid {D['border']};border-radius:3px;}}"
+            f"QPushButton:hover{{background:{D['acc']};color:#fff;border-color:{D['acc']};}}"
+        )
+        tb_next.clicked.connect(self._search_next); tbl.addWidget(tb_next)
 
         lay.addWidget(tb)
 
         # ── TextEdit ─────────────────────────────────────────────────────────
         self.edit = QTextEdit()
+        self.edit.setAcceptRichText(True)
         self.edit.setStyleSheet(
             f"QTextEdit{{background:{D['surf']};color:{D['text2']};"
             f"border:none;font-family:'JetBrains Mono',monospace;"
             f"font-size:11px;padding:6px;}}"
         )
-        self.edit.setText(self._notes.get())
+        # HTML betöltés ha van (színek megőrzésével), fallback plain text
+        saved_html = self._notes.get_html()
+        if saved_html and saved_html.strip():
+            self.edit.setHtml(saved_html)
+        elif self._notes.get().strip():
+            self.edit.setPlainText(self._notes.get())
+        # Ha mindkettő üres → üres editor
         self.edit.textChanged.connect(self._on_changed)
         self.edit.cursorPositionChanged.connect(self._sync_toolbar_state)
         lay.addWidget(self.edit)
 
-        # Register as observer
-        self._notes.register(self._on_notes_changed)
+        # ── Keresősáv (Ctrl+F, alapból rejtett) ──────────────────────────────
+        self._search_bar = QFrame()
+        self._search_bar.setStyleSheet(
+            f"QFrame{{background:{D['surf2']};border-top:1px solid {D['border']};padding:0;}}"
+        )
+        self._search_bar.setFixedHeight(36)
+        sbl = QHBoxLayout(self._search_bar)
+        sbl.setContentsMargins(6, 4, 6, 4); sbl.setSpacing(6)
+
+        self._search_inp = QLineEdit()
+        self._search_inp.setPlaceholderText("Keresés a jegyzetben... (Enter: következő, Shift+Enter: előző)")
+        self._search_inp.setStyleSheet(
+            f"QLineEdit{{background:{D['surf']};color:{D['text2']};border:1px solid {D['border']};"
+            f"border-radius:3px;padding:2px 6px;font-size:11px;}}"
+            f"QLineEdit:focus{{border-color:{D['acc']};}}"
+        )
+        self._search_inp.textChanged.connect(self._search_notes)
+        self._search_inp.returnPressed.connect(self._search_next)
+        sbl.addWidget(self._search_inp)
+
+        self._search_lbl = QLabel("")
+        self._search_lbl.setStyleSheet(f"color:{D['muted']};font-size:10px;min-width:60px;")
+        sbl.addWidget(self._search_lbl)
+
+        def _snav_btn(icon, tip, fn):
+            b = QPushButton(icon); b.setFixedSize(26, 26); b.setToolTip(tip)
+            b.setStyleSheet(
+                f"QPushButton{{background:{D['surf']};color:{D['text2']};border:1px solid {D['border']};"
+                f"border-radius:3px;}}"
+                f"QPushButton:hover{{background:{D['acc']};color:#fff;border-color:{D['acc']};}}"
+            )
+            b.clicked.connect(fn); sbl.addWidget(b); return b
+
+        _snav_btn("↑", "Előző (Shift+Enter)", self._search_prev)
+        _snav_btn("↓", "Következő (Enter)",   self._search_next)
+        _snav_btn("✕", "Bezárás (Esc)",        self._close_search)
+
+        self._search_bar.setVisible(False)
+        lay.addWidget(self._search_bar)
+
+        # Ctrl+F shortcut az editorra
+        QShortcut(QKeySequence("Ctrl+F"), self.edit, activated=self._open_search)
+        QShortcut(QKeySequence("Escape"), self._search_inp, activated=self._close_search)
+        # Shift+Enter az inputon = előző találat
+        QShortcut(QKeySequence("Shift+Return"), self._search_inp, activated=self._search_prev)
+
+        self._search_matches = []
+        self._search_idx     = -1
+        self._search_last    = ""
+
+        # HTML observer regisztrálás
+        self._notes.register_html(self._on_notes_html_changed)
 
     def closeEvent(self, e):
-        self._notes.unregister(self._on_notes_changed)
+        self._notes.unregister_html(self._on_notes_html_changed)
         super().closeEvent(e)
 
     # ── Sync ────────────────────────────────────────────────────────────────
     def _on_changed(self):
         if self._updating: return
-        self._notes.set(self.edit.toPlainText(), source=self._on_notes_changed)
+        # HTML-t mentünk, nem sima szöveget → megőrzi a színeket
+        self._notes.set_html(self.edit.toHtml(), source=self._on_notes_html_changed)
 
-    def _on_notes_changed(self, text):
-        if self.edit.toPlainText() == text: return
+    def _on_notes_html_changed(self, html):
+        if self.edit.toHtml() == html: return
         self._updating = True
         cur = self.edit.textCursor().position()
-        self.edit.setPlainText(text)
+        self.edit.setHtml(html)
         c = self.edit.textCursor()
-        c.setPosition(min(cur, len(text)))
+        c.setPosition(min(cur, len(self.edit.toPlainText())))
         self.edit.setTextCursor(c)
         self._updating = False
 
@@ -551,8 +741,135 @@ class NotesEditor(QWidget):
         fmt = QTextCharFormat(); fmt.setFontUnderline(checked)
         self.edit.mergeCurrentCharFormat(fmt)
 
+    def _apply_fg_color(self, color):
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
+        self.edit.mergeCurrentCharFormat(fmt)
+
+    def _apply_bg_color(self, color):
+        fmt = QTextCharFormat()
+        if color == "#00000000":
+            fmt.setBackground(QColor(0, 0, 0, 0))
+        else:
+            fmt.setBackground(QColor(color))
+        self.edit.mergeCurrentCharFormat(fmt)
+
     def _undo(self): self.edit.undo()
     def _redo(self): self.edit.redo()
+
+    # ── Keresés ──────────────────────────────────────────────────────────────
+    def _open_search(self):
+        self._tb_search.setFocus()
+        self._tb_search.selectAll()
+
+    def _close_search(self):
+        self._search_bar.setVisible(False)
+        self._clear_highlights()
+        self._search_matches = []
+        self._search_idx = -1
+        self._search_lbl.setText("")
+        self._tb_search_lbl.setText("")
+        self._tb_search.clear()
+        self.edit.setFocus()
+
+    def _clear_highlights(self):
+        """Összes keresési kiemelés eltávolítása."""
+        cur = self.edit.textCursor()
+        cur.select(QTextCursor.SelectionType.Document)
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor(0, 0, 0, 0))
+        cur.mergeCharFormat(fmt)
+        cur.clearSelection()
+        self.edit.setTextCursor(cur)
+
+    def _search_notes(self, text):
+        """Keresési találatok megkeresése és kiemelése. Mindkét keresőmezőt szinkronizálja."""
+        # Szinkronizálás: ha a toolbar mezőből jött, frissítsük a lenti sávot is, és fordítva
+        sender = self.sender()
+        if sender is self._tb_search and self._search_inp.text() != text:
+            self._search_inp.blockSignals(True)
+            self._search_inp.setText(text)
+            self._search_inp.blockSignals(False)
+        elif sender is self._search_inp and self._tb_search.text() != text:
+            self._tb_search.blockSignals(True)
+            self._tb_search.setText(text)
+            self._tb_search.blockSignals(False)
+
+        self._clear_highlights()
+        self._search_matches = []
+        self._search_idx = -1
+
+        if not text.strip():
+            self._search_lbl.setText("")
+            self._tb_search_lbl.setText("")
+            return
+
+        self._search_last = text
+        doc = self.edit.document()
+        highlight_fmt = QTextCharFormat()
+        highlight_fmt.setBackground(QColor("#3d3000"))
+
+        cur = QTextCursor(doc)
+        flags = QTextDocument.FindFlag(0)
+        while True:
+            cur = doc.find(text, cur, flags)
+            if cur.isNull(): break
+            self._search_matches.append(cur.position())
+            cur.mergeCharFormat(highlight_fmt)
+
+        n = len(self._search_matches)
+        lbl_style_ok  = f"color:{D['text2']};font-size:10px;min-width:44px;"
+        lbl_style_err = f"color:{D['red']};font-size:10px;min-width:44px;"
+        if n:
+            self._search_idx = 0
+            self._jump_to(0)
+            self._search_lbl.setStyleSheet(f"color:{D['text2']};font-size:10px;min-width:60px;")
+            self._tb_search_lbl.setStyleSheet(lbl_style_ok)
+        else:
+            self._search_lbl.setStyleSheet(f"color:{D['red']};font-size:10px;min-width:60px;")
+            self._tb_search_lbl.setStyleSheet(lbl_style_err)
+        label = f"{min(self._search_idx+1,n)}/{n}" if n else "0/0"
+        self._search_lbl.setText(label)
+        self._tb_search_lbl.setText(label)
+
+    def _jump_to(self, idx):
+        """Ugrás az idx-edik találathoz, aktív kiemelés."""
+        if not self._search_matches: return
+        n   = len(self._search_matches)
+        idx = idx % n
+        self._search_idx = idx
+
+        # Minden kiemelés visszaállítása halványra
+        doc = self.edit.document()
+        dim_fmt  = QTextCharFormat(); dim_fmt.setBackground(QColor("#3d3000"))
+        hi_fmt   = QTextCharFormat(); hi_fmt.setBackground(QColor("#b8860b"))
+
+        term = self._search_last
+        # Aktív találat erős kiemelése
+        for i, pos in enumerate(self._search_matches):
+            c = QTextCursor(doc)
+            c.setPosition(pos - len(term))
+            c.setPosition(pos, QTextCursor.MoveMode.KeepAnchor)
+            c.mergeCharFormat(hi_fmt if i == idx else dim_fmt)
+
+        # Görgetés az aktív találathoz
+        c = QTextCursor(doc)
+        c.setPosition(self._search_matches[idx])
+        self.edit.setTextCursor(c)
+        self.edit.ensureCursorVisible()
+
+        n = len(self._search_matches)
+        label = f"{idx+1}/{n}"
+        self._search_lbl.setText(label)
+        self._tb_search_lbl.setText(label)
+
+    def _search_next(self):
+        if self._search_matches:
+            self._jump_to(self._search_idx + 1)
+
+    def _search_prev(self):
+        if self._search_matches:
+            self._jump_to(self._search_idx - 1)
 
     def _sync_toolbar_state(self):
         fmt = self.edit.currentCharFormat()
@@ -592,7 +909,7 @@ class NotesDialog(QMainWindow):
     def _save_as(self):
         path, _ = QFileDialog.getSaveFileName(
             self, T("notes.save_title"),
-            f"inscop3_notes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            f"inscop3_notes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
             T("notes.save_filter")
         )
         if path:
@@ -2492,15 +2809,64 @@ class NoScrollComboBox(QComboBox):
 
 
 # ─── Scope file parser ────────────────────────────────────────────────────────
+def _wildcard_to_apex(pattern):
+    """
+    Egy wildcard mintából kinyeri az apex domain(oka)t, amire subfinder-t kell futtatni.
+    Példák:
+      *.xyz.com          → xyz.com
+      xy-*.xyz.com       → xyz.com
+      *.asd.*.xyz.com    → xyz.com  (legmélyebb nem-wildcard suffix)
+      *.asd.xyz.com      → xyz.com
+    Visszaad: (apex_domain, regex_pattern_string)
+    """
+    # Protokoll eltávolítása
+    p = re.sub(r'^https?://', '', pattern).rstrip('/')
+    parts = p.split('.')
+
+    # Apex = az utolsó N rész ahol nincs csillag, de legalább 2 rész
+    # Megkeressük a legjobboldalibb csillagos szegmenst
+    last_star_idx = -1
+    for i, seg in enumerate(parts):
+        if '*' in seg:
+            last_star_idx = i
+
+    if last_star_idx == -1:
+        # Nincs wildcard — normál domain
+        return p, None
+
+    # Az apex a last_star_idx utáni részek
+    apex_parts = parts[last_star_idx + 1:]
+    if len(apex_parts) < 1:
+        # Csak TLD maradt pl "*.com" — nem kezeljük
+        return None, None
+    apex = '.'.join(apex_parts)
+
+    # Regex pattern: csillag → bármely nem-pont karaktersorozat
+    escaped = re.escape(p).replace(r'\*', r'[^.]+')
+    regex = f'^{escaped}$'
+    return apex, regex
+
+
+def _is_wildcard_pattern(s):
+    """Igaz ha a string tartalmaz * karaktert és így wildcard pattern."""
+    return '*' in s
+
+
 def parse_scope_file(path):
     """
     Parse a bug bounty scope file (copy-pasted from platform).
-    Returns list of dicts: {domain, is_wildcard, scan_subfinder}
-    
+    Returns list of dicts: {domain, is_wildcard, scan_subfinder,
+                             wildcard_pattern, wildcard_regex, apex_domain}
+
     Supported types (second line of each block):
       URL, Web application, API              → direct domain, skip subfinder
       Wildcard                               → strip *., run subfinder
       Mobile application iOS/Android, other  → skip entirely
+
+    Wildcard formátumok (automatikusan felismeri, ha a sorban * van):
+      *.xyz.com          → subfinder xyz.com, összes eredmény
+      xy-*.xyz.com       → subfinder xyz.com, szűrés: xy-<valami>.xyz.com
+      *.asd.*.xyz.com    → subfinder xyz.com, szűrés: <valami>.asd.<valami>.xyz.com
     """
     SKIP_TYPES = {
         "mobile application ios", "mobile application android",
@@ -2521,7 +2887,6 @@ def parse_scope_file(path):
     except Exception as e:
         return [], str(e)
 
-    # Split into non-empty blocks separated by blank lines or just parse line by line
     lines = [l.rstrip() for l in raw.splitlines()]
 
     i = 0
@@ -2531,49 +2896,64 @@ def parse_scope_file(path):
             i += 1
             continue
 
-        # First line of block = the target
         target = line
-        # Second line = type (if exists and not blank)
         type_line = lines[i+1].strip().lower() if i+1 < len(lines) else ""
-        # Advance past this block (skip type line + tier/severity line)
         i += 1
         if type_line:
-            i += 1  # skip type line
-            # Skip tier/severity/extra lines until blank or next target
+            i += 1
             while i < len(lines) and lines[i].strip() and not _looks_like_target(lines[i].strip()):
                 i += 1
 
-        # Classify
         if any(sk in type_line for sk in SKIP_TYPES):
-            continue  # skip mobile / hardware / etc.
+            continue
 
         is_wildcard = any(wt in type_line for wt in WILDCARD_TYPES)
-        is_url      = any(ut in type_line for ut in URL_TYPES) or (not type_line and not is_wildcard)
 
-        # Clean the target
-        if target.startswith("*."):
-            target = target[2:]  # strip wildcard prefix
+        # Protokoll eltávolítása
+        target_clean = re.sub(r"^https?://", "", target).rstrip("/")
+
+        # Wildcard felismerés: ha a célban * van, automatikusan wildcard
+        wildcard_pattern = None
+        wildcard_regex   = None
+        apex_domain      = None
+
+        if _is_wildcard_pattern(target_clean):
             is_wildcard = True
-        
-        # Strip protocol if present
-        target = re.sub(r"^https?://", "", target).rstrip("/")
+            wildcard_pattern = target_clean
+            apex_domain, wildcard_regex = _wildcard_to_apex(target_clean)
+            if apex_domain is None:
+                i += 0; continue
+            # A "domain" mező az apex lesz, amire subfinder fut
+            domain = apex_domain
+        elif target_clean.startswith("*."):
+            # Klasszikus *.xyz.com forma
+            is_wildcard = True
+            wildcard_pattern = target_clean
+            domain = target_clean[2:]
+            apex_domain = domain
+            wildcard_regex = None  # minden subdomain OK
+        else:
+            domain = target_clean
+            apex_domain = domain
 
-        # Skip if clearly not a domain (IP ranges, empty, too short)
-        if not target or " " in target or "," in target:
+        # Skip ha nem domain
+        if not domain or " " in domain or "," in domain:
             continue
-        # Skip app store URLs, github, etc.
-        if any(skip in target for skip in ["apple.com", "play.google.com", "github.com"]):
+        if any(skip in domain for skip in ["apple.com", "play.google.com", "github.com"]):
             continue
-        # Must look like a domain
-        if not re.search(r"\.[a-z]{2,}$", target, re.I):
+        if not re.search(r"\.[a-z]{2,}$", domain, re.I):
             continue
 
-        if target not in seen:
-            seen.add(target)
+        key = wildcard_pattern or domain
+        if key not in seen:
+            seen.add(key)
             results.append({
-                "domain":          target,
-                "is_wildcard":     is_wildcard,
-                "scan_subfinder":  is_wildcard,  # wildcard → run subfinder
+                "domain":           domain,          # apex — subfinder erre fut
+                "is_wildcard":      is_wildcard,
+                "scan_subfinder":   is_wildcard,
+                "wildcard_pattern": wildcard_pattern, # eredeti minta pl. xy-*.xyz.com
+                "wildcard_regex":   wildcard_regex,   # compiled regex szűréshez
+                "apex_domain":      apex_domain,
             })
 
     return results, None
@@ -2590,11 +2970,13 @@ def _looks_like_target(s):
 # ─── ScanWorker ───────────────────────────────────────────────────────────────
 class ScanWorker(QThread):
     log=pyqtSignal(str); progress=pyqtSignal(int,str); done_db=pyqtSignal(dict); finished=pyqtSignal(bool,str)
-    def __init__(self,domain,rate,workdir,sudo_pw="",ua="",hdr="",skip_subfinder=False):
+    def __init__(self,domain,rate,workdir,sudo_pw="",ua="",hdr="",skip_subfinder=False,
+                 wildcard_regex=None,wildcard_pattern=None):
         super().__init__()
         self.domain=domain; self.rate=rate; self.workdir=workdir
         self.sudo_pw=sudo_pw; self.ua=ua; self.hdr=hdr
         self.skip_subfinder=skip_subfinder; self._stop=False
+        self.wildcard_regex=wildcard_regex; self.wildcard_pattern=wildcard_pattern
     def stop(self): self._stop=True
     def _cmd(self,cmd,label,shell=False):
         self.log.emit(f"<span style='color:#58a6ff'>▶ {label}</span>")
@@ -2614,10 +2996,11 @@ class ScanWorker(QThread):
         sf=os.path.join(wdir,"subdomains.txt")
         hf=os.path.join(wdir,"httpx.json")
         df=os.path.join(wdir,"dnsx.txt")
+        wildcard_regex = getattr(self, 'wildcard_regex', None)
+        wildcard_pattern = getattr(self, 'wildcard_pattern', None)
         # 1. subfinder (skip if direct URL scan)
         if self._stop: return
         if self.skip_subfinder:
-            # Direct URL mode: write the domain itself as the only "subdomain"
             self.log.emit(f"<span style='color:#d29922'>⤷ {T('scan.direct_url',d=d)}</span>")
             with open(sf,"w") as fw: fw.write(d+"\n")
             subs=[d]
@@ -2628,7 +3011,17 @@ class ScanWorker(QThread):
             self._cmd(f"{pw}subfinder -d {d} -all -o {shlex.quote(sf)} -silent","Subfinder",shell=True)
             if not os.path.exists(sf) or os.path.getsize(sf)==0:
                 self.finished.emit(False,"Subfinder hiba — nincs subdomain"); return
-            with open(sf) as f: subs=sorted(set(l.strip() for l in f if l.strip()))
+            with open(sf) as f: raw_subs=sorted(set(l.strip() for l in f if l.strip()))
+            # Wildcard pattern szűrés ha van (pl. xy-*.xyz.com → csak xy-valami.xyz.com)
+            if wildcard_regex:
+                subs = [s for s in raw_subs if re.match(wildcard_regex, s, re.I)]
+                self.log.emit(f"<span style='color:#d29922'>⤷ Wildcard szűrés: {wildcard_pattern} → {len(subs)}/{len(raw_subs)} match</span>")
+                # Felülírjuk a fájlt a szűrt listával
+                with open(sf,"w") as fw: fw.write("\n".join(subs)+"\n")
+            else:
+                subs = raw_subs
+            if not subs:
+                self.finished.emit(False,f"Wildcard szűrés után nincs találat: {wildcard_pattern}"); return
             self.log.emit(f"<span style='color:#3fb950'>✓ {len(subs)} subdomain</span>")
         self.progress.emit(25,f"{len(subs)} subdomain — httpx fut...")
         # 2. httpx
@@ -2887,12 +3280,13 @@ class BatchScanWorker(QThread):
             pct_end      = int((idx+1) / total * 100)
 
             self.log.emit(f"<span style='color:{D['acc']}'>▶ [{idx+1}/{total}] {domain} ({entry_type})</span>")
+            if entry.get("wildcard_pattern"):
+                self.log.emit(f"<span style='color:#d29922'>  ⤷ Wildcard: {entry['wildcard_pattern']}</span>")
             self.progress.emit(pct_base, f"[{idx+1}/{total}] {domain}")
 
             wdir = os.path.join(self.workdir_base, f"domain_{idx:04d}_{domain.replace('.','_')}")
             os.makedirs(wdir, exist_ok=True)
 
-            # Run synchronously using _SyncScan helper
             scanner = _SyncScan(
                 domain=domain, rate=self.rate, workdir=wdir,
                 sudo_pw=self.sudo_pw, ua=self.ua, hdr=self.hdr,
@@ -2900,6 +3294,9 @@ class BatchScanWorker(QThread):
                 log_fn=self.log.emit,
                 stop_fn=lambda: self._stop,
             )
+            # Wildcard adatok átadása
+            scanner.wildcard_regex   = entry.get("wildcard_regex")
+            scanner.wildcard_pattern = entry.get("wildcard_pattern")
             db = scanner.run()
             self._merged_db.update(db)
             self.done_db.emit(dict(self._merged_db))  # incremental update
@@ -2948,7 +3345,19 @@ class _SyncScan:
             if not os.path.exists(sf) or os.path.getsize(sf)==0:
                 self._log(f"<span style='color:#f85149'>  ✗ {T('scan.no_subfinder',d=d)}</span>")
                 return {}
-            with open(sf) as f: subs=sorted(set(l.strip() for l in f if l.strip()))
+            with open(sf) as f: raw_subs=sorted(set(l.strip() for l in f if l.strip()))
+            # Wildcard regex szűrés ha van (pl. xy-*.xyz.com)
+            wc_regex   = getattr(self, 'wildcard_regex', None)
+            wc_pattern = getattr(self, 'wildcard_pattern', None)
+            if wc_regex:
+                subs = [s for s in raw_subs if re.match(wc_regex, s, re.I)]
+                self._log(f"<span style='color:#d29922'>  ⤷ Wildcard szűrés: {wc_pattern} → {len(subs)}/{len(raw_subs)} match</span>")
+                with open(sf,"w") as fw: fw.write("\n".join(subs)+"\n")
+            else:
+                subs = raw_subs
+            if not subs:
+                self._log(f"<span style='color:#f85149'>  ✗ Wildcard szűrés után nincs találat: {wc_pattern}</span>")
+                return {}
             self._log(f"<span style='color:#3fb950'>  ✓ {len(subs)} subdomain: {d}</span>")
 
         if self._stopped(): return {}
@@ -4295,7 +4704,7 @@ class MainWindow(QMainWindow):
         dlg=SudoDialog(self)
         if dlg.exec()!=QDialog.DialogCode.Accepted: return
         rate=self._rate.value(); ua=self._user_agent.text().strip(); hdr=self._req_header.text().strip()
-        self._sudo_pw = dlg.password  # store for tool dialogs
+        self._sudo_pw = dlg.password
         _AppSettings._sudo_pw = self._sudo_pw
         self._n=0; self._table.clear_all(); self._lv.clear(); self._prog.setValue(0)
         self._rbtn.setEnabled(False); self._sbtn.setEnabled(True); self._badge.setText("0 host")
@@ -4303,7 +4712,17 @@ class MainWindow(QMainWindow):
         wdir=tempfile.mkdtemp(prefix=f"wcrecon_{safe}_{ts}_")
         self._log(f"<span style='color:{D['acc']};font-weight:bold;'>═══ InScop3 Recon v3 — {domain} ═══</span>")
         self._log(f"<span style='color:{D['muted']}'>Rate: {rate} | Dir: {wdir}</span>")
-        self._worker=ScanWorker(domain,rate,wdir,dlg.password,ua,hdr)
+        # Wildcard felismerés az egyes domain scan-nél is
+        wc_regex = wc_pattern = None
+        apex = domain
+        if _is_wildcard_pattern(domain):
+            apex, wc_regex = _wildcard_to_apex(domain)
+            wc_pattern = domain
+            if apex:
+                self._log(f"<span style='color:#d29922'>⤷ Wildcard: {domain} → subfinder: {apex}</span>")
+                domain = apex
+        self._worker=ScanWorker(domain,rate,wdir,dlg.password,ua,hdr,
+                                wildcard_regex=wc_regex,wildcard_pattern=wc_pattern)
         self._worker.log.connect(self._log)
         self._worker.progress.connect(lambda v,m: (self._prog.setValue(v),self._sl.setText(f"  ⚙  {m}")))
         self._worker.done_db.connect(self._on_db); self._worker.finished.connect(self._on_done); self._worker.start()
@@ -4384,7 +4803,7 @@ class MainWindow(QMainWindow):
             "rate":       self._rate.value(),
             "ua":         self._user_agent.text().strip(),
             "header":     self._req_header.text().strip(),
-            "notes":      GlobalNotes().get(),
+            "notes":      GlobalNotes().get_html() or GlobalNotes().get(),
             "http_codes": http_codes,
         }
         try:
@@ -4428,7 +4847,11 @@ class MainWindow(QMainWindow):
 
         # ── Jegyzetek visszaállítása ─────────────────────────────────────────
         if notes:
-            GlobalNotes().set(notes)
+            # Ha HTML tartalmaz (< jellel kezdődik), html-ként töltjük be
+            if notes.strip().startswith("<"):
+                GlobalNotes().set_html(notes)
+            else:
+                GlobalNotes().set(notes)
 
         self._log(f"<span style='color:{D['green']}'>✓ Munkamenet betöltve: {self._n} host"
                   + (f", beállítások visszaállítva" if settings else "")
@@ -4512,8 +4935,19 @@ def main():
     # 2. Tool checker
     checker=ToolCheckerDialog()
     if checker.exec()!=QDialog.DialogCode.Accepted: sys.exit(0)
-    # 3. Main window
-    win=MainWindow(); win.show(); sys.exit(app.exec())
+    # 3. Induláskor töröljük a notes.html-t — mindig üres a jegyzet
+    _notes_html = os.path.join(os.path.expanduser("~/.local/share/inscop3"), "notes.html")
+    try:
+        if os.path.exists(_notes_html): os.remove(_notes_html)
+    except Exception: pass
+    # 4. Main window
+    win=MainWindow(); win.show()
+    ret = app.exec()
+    # 5. Kilépéskor is töröljük — ne maradjon persistent tartalom
+    try:
+        if os.path.exists(_notes_html): os.remove(_notes_html)
+    except Exception: pass
+    sys.exit(ret)
 
 if __name__=="__main__":
     main()
