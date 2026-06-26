@@ -3016,8 +3016,13 @@ class ScanWorker(QThread):
             if wildcard_regex:
                 subs = [s for s in raw_subs if re.match(wildcard_regex, s, re.I)]
                 self.log.emit(f"<span style='color:#d29922'>⤷ Wildcard szűrés: {wildcard_pattern} → {len(subs)}/{len(raw_subs)} match</span>")
-                # Felülírjuk a fájlt a szűrt listával
-                with open(sf,"w") as fw: fw.write("\n".join(subs)+"\n")
+                # Külön fájlba írjuk, ne a subfinder sudo-owned fájljába
+                sf_filtered = os.path.join(wdir, "subdomains_filtered.txt")
+                try:
+                    with open(sf_filtered, "w") as fw: fw.write("\n".join(subs)+"\n")
+                    sf = sf_filtered
+                except Exception as e:
+                    self.log.emit(f"<span style='color:#f85149'>✗ Szűrt lista írási hiba: {e}</span>")
             else:
                 subs = raw_subs
             if not subs:
@@ -3352,7 +3357,13 @@ class _SyncScan:
             if wc_regex:
                 subs = [s for s in raw_subs if re.match(wc_regex, s, re.I)]
                 self._log(f"<span style='color:#d29922'>  ⤷ Wildcard szűrés: {wc_pattern} → {len(subs)}/{len(raw_subs)} match</span>")
-                with open(sf,"w") as fw: fw.write("\n".join(subs)+"\n")
+                # Külön fájlba írjuk (sf lehet sudo-owned → PermissionError)
+                sf_filtered = os.path.join(self.workdir, "subdomains_filtered.txt")
+                try:
+                    with open(sf_filtered, "w") as fw: fw.write("\n".join(subs)+"\n")
+                    sf = sf_filtered  # httpx ezt kapja
+                except Exception as e:
+                    self._log(f"<span style='color:#f85149'>  ✗ Szűrt lista írási hiba: {e}</span>")
             else:
                 subs = raw_subs
             if not subs:
