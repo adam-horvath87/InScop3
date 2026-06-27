@@ -1169,11 +1169,12 @@ class BaseToolDialog(QDialog):
 
         # ── Fő splitter: bal=tool, jobb=notes ────────────────────────────────
         self._main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self._main_splitter.setHandleWidth(2)
+        self._main_splitter.setHandleWidth(6)
         self._main_splitter.setStyleSheet(
-            f"QSplitter::handle{{background:{D['border']};}}"
-            f"QSplitter::handle:hover{{background:{D['acc']};}}"
+            f"QSplitter::handle:horizontal{{background:{D['border']};width:6px;}}"
+            f"QSplitter::handle:horizontal:hover{{background:{D['acc']};}}"
         )
+        self._main_splitter.setChildrenCollapsible(False)  # egyik oldal sem tűnhet el húzáskor
 
         # ── BAL OLDAL: tool panel (minden korábbi tartalom) ──────────────────
         tool_widget = QWidget()
@@ -1263,11 +1264,16 @@ class BaseToolDialog(QDialog):
         np_lay.addWidget(self._notes_embed)
         self._main_splitter.addWidget(self._notes_panel_widget)
 
-        # Kezdeti arányok: tool=100%, notes=0%
-        self._main_splitter.setSizes([1, 0])
-        self._main_splitter.setCollapsible(0, False)
-        self._main_splitter.setCollapsible(1, True)
+        # Kezdeti arányok: tool=100%, notes=0 szélesség (rejtve)
+        # setChildrenCollapsible(False) → húzáskor egyik sem tűnik el
+        # A notes panel kezdetben 0 szélességű, de minimum 200px ha megnyílik
+        self._notes_panel_widget.setMinimumWidth(0)
+        self._notes_panel_widget.hide()  # kezdetben teljesen rejtve
         self._notes_panel_open = False
+
+        # setSizes QTimer-rel — mikor már van tényleges ablakméret
+        QTimer.singleShot(0, lambda: self._main_splitter.setSizes(
+            [self._main_splitter.width(), 0]))
 
         # Toggle gomb — a splitter jobb szélén, vékony függőleges sáv
         self._notes_toggle_btn = QPushButton("◀")
@@ -1501,16 +1507,23 @@ class BaseToolDialog(QDialog):
         """Jobb oldali notes panel — az EGÉSZ ablak felét nyitja/zárja."""
         total = self._main_splitter.width()
         if self._notes_panel_open:
-            # Bezárás: tool=100%, notes=0%
-            self._main_splitter.setSizes([total, 0])
-            self._notes_toggle_btn.setText("◀")
+            # Bezárás: megjegyezzük a szélességet, elrejtjük
+            sizes = self._main_splitter.sizes()
+            if len(sizes) > 1 and sizes[1] > 0:
+                self._last_notes_width = sizes[1]
+            self._notes_panel_widget.hide()
             self._notes_panel_open = False
+            self._notes_toggle_btn.setText("◀")
         else:
-            # Megnyitás: pontosan 50-50%
-            half = max(total // 2, 250)
-            self._main_splitter.setSizes([half, half])
-            self._notes_toggle_btn.setText("▶")
+            # Megnyitás: előző szélesség vagy fele az ablaknak
+            notes_w = getattr(self, '_last_notes_width', max(300, total // 2))
+            notes_w = min(notes_w, total - 200)
+            notes_w = max(notes_w, 200)
+            self._notes_panel_widget.setMinimumWidth(150)
+            self._notes_panel_widget.show()
+            self._main_splitter.setSizes([total - notes_w, notes_w])
             self._notes_panel_open = True
+            self._notes_toggle_btn.setText("▶")
 
 # ─── Dig ─────────────────────────────────────────────────────────────────────
 class DigDialog(BaseToolDialog):
