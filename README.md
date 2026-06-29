@@ -43,7 +43,7 @@ It is designed for bug bounty hunters, penetration testers, and security researc
 - **Subdomain takeover detection** — flags NXDOMAIN entries that are potential takeover candidates
 - **Batch scanning** — import a scope list and scan multiple domains sequentially
 - **Results table** with live filtering by subdomain, HTTP status, web server, technology, DNS type, IP/CNAME value, and takeover flag
-- **Export** — save results as pipe-separated `.txt` files
+- **Export** — save your whole session into one file, then continue later where you left
 - **Built-in Notes editor** — formatted notes (bold, italic, underline), font control, undo/redo, save-as; starts empty on every launch
 - **Direct URL mode** — skip subfinder and probe a target directly (useful for IPs or specific endpoints)
 - **Root flag** — optionally run `subfinder -all` for broader enumeration (requires sudo)
